@@ -586,7 +586,8 @@ fn shopfront(b: &mut Builder, c: Cell, d: Dir, y: f32, trade: UnitUse, open: boo
         _ => Some(srgb(120, 110, 90)),
     };
     if let Some(col) = awning {
-        b.visual(out_box(c, d, 0.05, C - 0.05, y + 2.48, y + 2.56, 0.0, 0.7), col, 0.0, ALL);
+        // At door height, below the name board, so it never hides the name.
+        b.visual(out_box(c, d, 0.05, C - 0.05, y + 2.06, y + 2.13, 0.0, 0.6), col, 0.0, ALL);
     }
     let lit_warm = srgb(255, 214, 160);
     match trade {
@@ -595,7 +596,7 @@ fn shopfront(b: &mut Builder, c: Cell, d: Dir, y: f32, trade: UnitUse, open: boo
             // Roast ducks and pork hanging in the window.
             for k in 0..4 {
                 let a = 0.25 + k as f32 * 0.28;
-                b.visual(out_box(c, d, a, a + 0.14, y + 1.75, y + 2.2, 0.08, 0.2), srgb(170, 80, 30), 0.15, ALL);
+                b.visual(out_box(c, d, a, a + 0.14, y + 1.5, y + 1.95, 0.08, 0.2), srgb(170, 80, 30), 0.15, ALL);
             }
         }
         Shop => {
