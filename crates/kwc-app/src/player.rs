@@ -38,8 +38,32 @@ impl Player {
         Player { pos, vel: Vec3::ZERO, yaw, pitch: 0.0, on_ground: false, climbing: false }
     }
 
-    fn aabb_at(p: Vec3) -> Aabb {
+    pub fn aabb_at(p: Vec3) -> Aabb {
         Aabb::new(Vec3::new(p.x - RADIUS, p.y, p.z - RADIUS), Vec3::new(p.x + RADIUS, p.y + HEIGHT, p.z + RADIUS))
+    }
+
+    /// If standing inside something solid (a save from before a hut went up
+    /// there, say), move to the nearest free spot: same level first, then the ground.
+    pub fn unstick(&mut self, w: &WalkWorld) {
+        if !w.blocked(&Self::aabb_at(self.pos)) {
+            return;
+        }
+        for y in [self.pos.y, 0.0] {
+            for ring in 1..=80 {
+                let r = ring as f32 * 0.25;
+                let n = 8 * ring;
+                for k in 0..n {
+                    let a = k as f32 / n as f32 * std::f32::consts::TAU;
+                    let p = Vec3::new(self.pos.x + r * a.cos(), y, self.pos.z + r * a.sin());
+                    if !w.blocked(&Self::aabb_at(p)) {
+                        self.pos = p;
+                        self.vel = Vec3::ZERO;
+                        return;
+                    }
+                }
+            }
+        }
+        self.pos = w.spawn;
     }
 
     pub fn look(&mut self, dx: f32, dy: f32) {

@@ -360,6 +360,7 @@ impl App {
                     w.player.pos = Vec3::new(p[0], p[1], p[2]);
                     w.player.yaw = p[3];
                 }
+                w.player.unstick(&w.world);
                 Some(w)
             }
         };
@@ -1125,6 +1126,20 @@ mod tests {
             eprintln!("coplanar overlap: axis {} +{} at {:.3} m, {:.3} m2, colours {:?} / {:?}", h.0 .0, h.0 .1, h.0 .2 as f32 / 1000.0, h.1, h.2, h.3);
         }
         hits.len()
+    }
+
+    /// A save from inside what is now a hut gets you out, not stuck.
+    #[test]
+    fn unstick_from_solid() {
+        let city = generate(&Params::default());
+        let (w, _) = world::build(&city, START_YEAR);
+        let free = |p: Vec3| !w.blocked(&player::Player::aabb_at(p));
+        let saved = Vec3::new(195.35, 0.0, 92.97);
+        assert!(!free(saved), "the save spot is no longer inside anything");
+        let mut p = player::Player::new(saved, 0.0);
+        p.unstick(&w);
+        assert!(free(p.pos), "still stuck at {:?}", p.pos);
+        assert!(p.pos.distance(Vec3::new(195.35, 0.0, 92.97)) < 5.0);
     }
 
     /// Knowing an era needs both: enough lanes walked, and deliveries by memory.
