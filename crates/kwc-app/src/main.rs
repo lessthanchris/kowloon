@@ -9,6 +9,8 @@ mod citymesh;
 mod game;
 mod lighting;
 mod lights;
+mod panels;
+mod plane;
 mod player;
 mod signtext;
 mod world;
@@ -42,6 +44,10 @@ struct Settings {
     help: bool,
     /// Memory mode (G): no place line, door names or arrow; only the street plaques.
     memory: bool,
+    /// The notebook map (M) and the ledger (L).
+    map_open: bool,
+    ledger_open: bool,
+    ledger_pick: Option<usize>,
 }
 
 struct World {
@@ -147,6 +153,10 @@ struct App {
     /// The delivery game (None = free roaming).
     game: Option<game::Game>,
     signs: signtext::SignText,
+    /// Moving on: the timelapse runs to this year, then you're back on foot.
+    pending_era: Option<u16>,
+    started: Instant,
+    plane: Option<GpuMesh>,
     keys: HashSet<KeyCode>,
     drag: Option<MouseButton>,
     last_cursor: Option<(f64, f64)>,
@@ -171,6 +181,9 @@ impl ApplicationHandler for App {
     }
 
     fn device_event(&mut self, _el: &ActiveEventLoop, _id: DeviceId, event: DeviceEvent) {
+        if self.settings.map_open || self.settings.ledger_open {
+            return;
+        }
         if let (DeviceEvent::MouseMotion { delta }, Some(w)) = (event, self.walk.as_mut()) {
             w.player.look(delta.0 as f32, delta.1 as f32);
         }
@@ -179,9 +192,13 @@ impl ApplicationHandler for App {
     fn window_event(&mut self, el: &ActiveEventLoop, _id: WindowId, event: WindowEvent) {
         let Some(run) = self.run.as_mut() else { return };
         let walking = self.walk.is_some();
-        let consumed = !walking && run.gui.on_event(&run.window, &event);
+        let panel = self.settings.map_open || self.settings.ledger_open;
+        let consumed = (!walking || panel) && run.gui.on_event(&run.window, &event);
         match event {
-            WindowEvent::CloseRequested => el.exit(),
+            WindowEvent::CloseRequested => {
+                self.save_game();
+                el.exit()
+            }
             WindowEvent::Resized(size) => {
                 run.gpu.resize(size.width, size.height);
                 run.renderer.resize(&run.gpu.device, size.width, size.height);
@@ -204,6 +221,17 @@ impl ApplicationHandler for App {
                             KeyCode::KeyE if walking => self.interact(),
                             KeyCode::KeyH => self.settings.help = !self.settings.help,
                             KeyCode::KeyG => self.settings.memory = !self.settings.memory,
+                            KeyCode::KeyM if walking => {
+                                self.settings.map_open = !self.settings.map_open;
+                                self.settings.ledger_open = false;
+                                self.sync_cursor();
+                            }
+                            KeyCode::KeyL if walking => {
+                                self.settings.ledger_open = !self.settings.ledger_open;
+                                self.settings.map_open = false;
+                                self.sync_cursor();
+                            }
+                            KeyCode::KeyY if walking => self.move_on(),
                             _ => {}
                         }
                     }
@@ -257,6 +285,59 @@ impl App {
         if g.delivered > 0 {
             self.settings.help = false;
         }
+        self.save_game();
+    }
+
+    fn save_game(&self) {
+        if let Some(g) = &self.game {
+            if let Ok(json) = serde_json::to_string(&g.save()) {
+                let _ = std::fs::write(SAVE_FILE, json);
+            }
+        }
+    }
+
+    fn sync_cursor(&self) {
+        let Some(run) = &self.run else { return };
+        let w = &run.window;
+        if self.settings.map_open || self.settings.ledger_open || self.walk.is_none() {
+            let _ = w.set_cursor_grab(CursorGrabMode::None);
+            w.set_cursor_visible(true);
+        } else {
+            let _ = w.set_cursor_grab(CursorGrabMode::Locked).or_else(|_| w.set_cursor_grab(CursorGrabMode::Confined));
+            w.set_cursor_visible(false);
+        }
+    }
+
+    /// Y: once you know this era, watch the city grow to the next and carry on.
+    fn move_on(&mut self) {
+        let city = &self.world.city;
+        let Some(g) = self.game.as_ref() else { return };
+        let Some(next) = g.next_era() else {
+            if let Some(g) = self.game.as_mut() {
+                g.toast("This is the last year: 1987. The clearance is coming.");
+            }
+            return;
+        };
+        if !g.knows_era(city) {
+            let msg = format!(
+                "Not yet: walk more of the lanes ({:.0}%/{:.0}%) and make {} deliveries by memory ({} so far).",
+                g.coverage(city) * 100.0,
+                game::KNOW_COVERAGE * 100.0,
+                game::KNOW_CLEAN,
+                g.clean
+            );
+            if let Some(g) = self.game.as_mut() {
+                g.toast(msg);
+            }
+            return;
+        }
+        self.settings.year = g.year as f32;
+        self.settings.speed = 1.5;
+        self.settings.playing = true;
+        self.settings.map_open = false;
+        self.settings.ledger_open = false;
+        self.pending_era = Some(next);
+        self.leave_walk();
     }
 
     fn enter_walk(&mut self) {
@@ -311,6 +392,31 @@ impl App {
             if g.job.is_none() {
                 g.new_job(&self.world.city, &self.world.society);
             }
+            if let Some(w) = &self.walk {
+                g.observe(&self.world.city, w.player.pos);
+                // Any help during a job means it wasn't done from memory.
+                if g.job.is_some() && (!self.settings.memory || self.settings.map_open) {
+                    g.job_helped = true;
+                }
+                if !g.understood && g.knows_era(&self.world.city) {
+                    g.understood = true;
+                    let next = g.next_era().map_or("the end".to_string(), |n| n.to_string());
+                    g.toast(format!("You know {}'s Walled City. Press Y to move on to {next}, or keep delivering.", g.year));
+                }
+            }
+        }
+        // The timelapse between eras: when it reaches the next era, back on foot.
+        if let Some(next) = self.pending_era {
+            if self.settings.year >= next as f32 {
+                self.settings.year = next as f32;
+                self.settings.playing = false;
+                self.pending_era = None;
+                if let Some(g) = self.game.as_mut() {
+                    g.enter_era(&self.world.city, next);
+                }
+                self.save_game();
+                self.settings.want_walk = true;
+            }
         }
         if let (Some(w), Some(run)) = (self.walk.as_mut(), self.run.as_ref()) {
             let key = self.game.as_ref().and_then(|g| g.job.as_ref()).map(|j| (j.from, j.to, j.picked));
@@ -350,7 +456,10 @@ impl App {
         };
         let view = frame.texture.create_view(&Default::default());
         let mut enc = run.gpu.device.create_command_encoder(&Default::default());
-        let mut meshes: Vec<&GpuMesh> = self.world.mesh.iter().collect();
+        // The Kai Tak jet, rebuilt where it is this frame.
+        let t = self.started.elapsed().as_secs_f32();
+        self.plane = plane::mesh(t, citymesh::centre(&self.world.city)).and_then(|m| GpuMesh::upload(&run.gpu.device, &m));
+        let mut meshes: Vec<&GpuMesh> = self.world.mesh.iter().chain(self.plane.iter()).collect();
         let params = match &self.walk {
             Some(w) => {
                 meshes.extend(w.interior.iter());
@@ -366,9 +475,31 @@ impl App {
         let walk = self.walk.as_ref();
         let info = walk.map(|w| hud_info(&self.world, w, self.game.as_ref(), &params, s.memory));
         let game = self.game.as_ref();
+        let (city, soc) = (&self.world.city, &self.world.society);
+        let progress = game.map(|g| (g.coverage(city), g.clean, g.knows_era(city), g.next_era()));
+        let pending = self.pending_era;
         let cmds = run.gui.draw(&run.gpu, &run.window, &mut enc, &view, |ui| match (walk, &info) {
-            (Some(w), Some(info)) => hud(ui, w, s, game, info, fps),
-            _ => panel(ui, s, &stats, fps),
+            (Some(w), Some(info)) => {
+                hud(ui, w, s, game, info, fps, progress);
+                if let (true, Some(g)) = (s.map_open, game) {
+                    panels::notebook(ui, city, soc, g, w.player.pos, w.player.yaw);
+                }
+                if let (true, Some(g)) = (s.ledger_open, game) {
+                    panels::ledger(ui, soc, g, &mut s.ledger_pick);
+                }
+            }
+            _ => {
+                panel(ui, s, &stats, fps);
+                if let Some(n) = pending {
+                    ui.ctx().layer_painter(egui::LayerId::new(egui::Order::Foreground, egui::Id::new("era"))).text(
+                        ui.max_rect().center_top() + egui::vec2(0.0, 60.0),
+                        egui::Align2::CENTER_CENTER,
+                        format!("{:.0} → {n}", s.year.floor()),
+                        egui::FontId::proportional(40.0),
+                        egui::Color32::from_rgb(240, 230, 200),
+                    );
+                }
+            }
         });
         run.gpu.queue.submit(cmds.into_iter().chain([enc.finish()]));
         run.window.pre_present_notify();
@@ -477,7 +608,7 @@ fn hud_info(wd: &World, w: &Walk, g: Option<&game::Game>, params: &FrameParams, 
     HudInfo { place, labels, from_addr, to_addr, arrow }
 }
 
-fn hud(ui: &mut egui::Ui, w: &Walk, s: &Settings, g: Option<&game::Game>, info: &HudInfo, fps: f32) {
+fn hud(ui: &mut egui::Ui, w: &Walk, s: &Settings, g: Option<&game::Game>, info: &HudInfo, fps: f32, progress: Option<(f32, u32, bool, Option<u16>)>) {
     use egui::{Align2, Color32, FontId, Pos2, Stroke};
     let screen = ui.max_rect();
     let painter = ui.ctx().layer_painter(egui::LayerId::new(egui::Order::Background, egui::Id::new("labels")));
@@ -554,6 +685,7 @@ fn hud(ui: &mut egui::Ui, w: &Walk, s: &Settings, g: Option<&game::Game>, info: 
                 line(ui, "3. Names float over doors as you pass. Your pick-up glows green, your drop-off amber.");
                 line(ui, "4. Flats are upstairs: go in at the building's street door and take the stairs. \"Flat 3B\" is door B on 3/F; G/F is the ground floor.");
                 line(ui, "5. Stand right in front of the door and press E.");
+                line(ui, "6. To know the city: walk its lanes (M shows your notebook) and make deliveries by memory, with G memory mode on and the notebook shut. Then Y moves you on a few years, and the city grows.");
                 ui.add_space(6.0);
                 ui.colored_label(Color32::from_white_alpha(140), "Mouse look · WASD walk · Shift run · Space jump · T torch · N night · Tab city view · H hide this");
             });
@@ -566,6 +698,17 @@ fn hud(ui: &mut egui::Ui, w: &Walk, s: &Settings, g: Option<&game::Game>, info: 
             egui::Frame::new().fill(Color32::from_rgba_unmultiplied(20, 18, 16, 225)).inner_margin(12.0).corner_radius(4.0).show(ui, |ui| {
                 ui.set_max_width(360.0);
                 ui.colored_label(paper, egui::RichText::new(format!("{} · Delivered {} · Tips HK${}", g.year, g.delivered, g.tips)).small());
+                if let Some((cov, clean, knows, next)) = progress {
+                    let line = if knows {
+                        match next {
+                            Some(n) => format!("You know this city. Y: move on to {n}"),
+                            None => "You know the city as it was at the end.".into(),
+                        }
+                    } else {
+                        format!("Lanes walked {:.0}% / {:.0}% · By memory {clean}/{}", cov * 100.0, game::KNOW_COVERAGE * 100.0, game::KNOW_CLEAN)
+                    };
+                    ui.colored_label(if knows { Color32::from_rgb(255, 215, 120) } else { Color32::from_rgb(170, 165, 150) }, egui::RichText::new(line).small());
+                }
                 ui.separator();
                 match &g.job {
                     Some(j) => {
@@ -601,7 +744,7 @@ fn hud(ui: &mut egui::Ui, w: &Walk, s: &Settings, g: Option<&game::Game>, info: 
         ui.colored_label(
             Color32::from_white_alpha(110),
             egui::RichText::new(format!(
-                "WASD walk · Shift run · E knock · W on a ladder to climb · T torch ({}) · N night · G memory mode · H help · Tab overview · {fps:.0} fps",
+                "WASD walk · E knock · M notebook · L ledger · G memory mode · Y move on · T torch ({}) · N night · H help · Tab overview · {fps:.0} fps",
                 if s.torch { "on" } else { "off" }
             ))
             .small(),
@@ -669,6 +812,8 @@ fn panel(ui: &mut egui::Ui, s: &mut Settings, st: &stats::Stats, fps: f32) {
     });
 }
 
+const SAVE_FILE: &str = "save.json";
+
 fn arg<T: std::str::FromStr>(args: &[String], name: &str) -> Option<T> {
     args.iter().position(|a| a == name).and_then(|i| args.get(i + 1)).and_then(|v| v.parse().ok())
 }
@@ -687,7 +832,8 @@ fn screenshot(args: &[String], out: &str) {
     let mut world = World::new(seed);
     world.ensure_mesh(&gpu, year, mode);
     let walk: Option<Walk>;
-    let mut meshes: Vec<&GpuMesh> = world.mesh.iter().collect();
+    let plane_mesh = arg::<f32>(args, "--plane").and_then(|t| plane::mesh(t, citymesh::centre(&world.city))).and_then(|m| GpuMesh::upload(&gpu.device, &m));
+    let mut meshes: Vec<&GpuMesh> = world.mesh.iter().chain(plane_mesh.iter()).collect();
     let params = if args.iter().any(|a| a == "--walk") {
         let signs = signtext::SignText::new();
         walk = Some(Walk::new(&gpu, &mut renderer, &signs, &world.city, &world.society, year));
@@ -763,13 +909,22 @@ fn main() {
     let free_walk = args.iter().any(|a| a == "--walk");
     let overview = args.iter().any(|a| a == "--free");
     let walk_now = !overview;
-    let game = (!free_walk && !overview).then(|| game::Game::new(1987, START_YEAR));
+    // Carry on from the save unless asked for a fresh start (--new).
+    let saved = (!args.iter().any(|a| a == "--new"))
+        .then(|| std::fs::read_to_string(SAVE_FILE).ok())
+        .flatten()
+        .and_then(|s| serde_json::from_str::<game::Save>(&s).ok());
+    let game = (!free_walk && !overview).then(|| match saved {
+        Some(s) => game::Game::load(s),
+        None => game::Game::new(1987, START_YEAR),
+    });
+    let start_year = game.as_ref().map_or(START_YEAR, |g| g.year);
     let mut app = App {
         run: None,
         world,
         settings: Settings {
             seed: 1987,
-            year: if free_walk { END_YEAR as f32 } else { START_YEAR as f32 },
+            year: if free_walk { END_YEAR as f32 } else { start_year as f32 },
             playing: !walk_now,
             speed: 2.0,
             mode: ColourMode::Grime,
@@ -778,11 +933,17 @@ fn main() {
             want_walk: walk_now,
             help: true,
             memory: false,
+            map_open: false,
+            ledger_open: false,
+            ledger_pick: None,
         },
         orbit,
         walk: None,
         game,
         signs: signtext::SignText::new(),
+        pending_era: None,
+        started: Instant::now(),
+        plane: None,
         keys: HashSet::new(),
         drag: None,
         last_cursor: None,
@@ -942,5 +1103,30 @@ mod tests {
             eprintln!("coplanar overlap: axis {} +{} at {:.3} m, {:.3} m2, colours {:?} / {:?}", h.0 .0, h.0 .1, h.0 .2 as f32 / 1000.0, h.1, h.2, h.3);
         }
         assert!(hits.is_empty(), "{} visible z-fighting overlaps", hits.len());
+    }
+
+    /// Knowing an era needs both: enough lanes walked, and deliveries by memory.
+    /// Moving on resets the memory count and blanks only what was rebuilt.
+    #[test]
+    fn era_progression() {
+        let city = generate(&Params::default());
+        let mut g = game::Game::new(1987, 1950);
+        assert!(!g.knows_era(&city));
+        for k in 0..city.w * city.d {
+            if city.ground[k] == Ground::Alley {
+                g.seen.insert(((k % city.w) as u16, (k / city.w) as u16));
+            }
+        }
+        assert!(!g.knows_era(&city), "walking alone isn't enough");
+        g.clean = game::KNOW_CLEAN;
+        assert!(g.knows_era(&city));
+        assert_eq!(g.next_era(), Some(1955));
+        let before = g.seen.len();
+        g.enter_era(&city, 1955);
+        assert_eq!((g.year, g.clean), (1955, 0));
+        assert!(g.seen.len() <= before && !g.seen.is_empty(), "lanes that didn't change stay in the notebook");
+        // Saving and loading keeps it all.
+        let back = game::Game::load(serde_json::from_str(&serde_json::to_string(&g.save()).unwrap()).unwrap());
+        assert_eq!((back.year, back.seen.len()), (g.year, g.seen.len()));
     }
 }

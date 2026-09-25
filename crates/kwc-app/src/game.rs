@@ -96,6 +96,29 @@ pub struct Job {
     pub tip: u32,
 }
 
+/// The chapters of the game: you move on when you choose, once you know the place.
+pub const ERAS: [u16; 8] = [1950, 1955, 1960, 1965, 1970, 1975, 1980, 1987];
+/// Knowing an era: this much of its lanes walked, and this many deliveries made
+/// by memory alone (memory mode on, notebook shut).
+pub const KNOW_COVERAGE: f32 = 0.5;
+pub const KNOW_CLEAN: u32 = 3;
+
+/// Someone you delivered to.
+#[derive(Clone, Copy, Debug, serde::Serialize, serde::Deserialize)]
+pub struct Met {
+    /// 0 = household, 1 = business.
+    pub kind: u8,
+    pub id: u32,
+    pub unit: u32,
+    pub year: u16,
+}
+
+impl Met {
+    pub fn occupant(&self) -> Occupant {
+        if self.kind == 0 { Occupant::Household(self.id) } else { Occupant::Business(self.id) }
+    }
+}
+
 pub struct Game {
     pub year: u16,
     pub delivered: u32,
@@ -104,6 +127,27 @@ pub struct Game {
     /// A short message and how long it stays up (s).
     pub toast: Option<(String, f32)>,
     rng: ChaCha8Rng,
+    pub seed: u64,
+    /// Cells you've walked near this era: what your notebook shows.
+    pub seen: std::collections::HashSet<Cell>,
+    /// Deliveries this era made by memory alone.
+    pub clean: u32,
+    /// Did you lean on the notebook, names or arrow during the current job?
+    pub job_helped: bool,
+    pub met: Vec<Met>,
+    /// This era is understood (shown once).
+    pub understood: bool,
+}
+
+#[derive(serde::Serialize, serde::Deserialize)]
+pub struct Save {
+    pub seed: u64,
+    pub year: u16,
+    pub delivered: u32,
+    pub tips: u32,
+    pub clean: u32,
+    pub seen: Vec<Cell>,
+    pub met: Vec<Met>,
 }
 
 fn item_for(trade: UnitUse, rng: &mut impl Rng) -> &'static str {
@@ -140,7 +184,77 @@ fn recipient(soc: &Society, year: u16, occ: Occupant, rng: &mut impl Rng) -> Str
 
 impl Game {
     pub fn new(seed: u64, year: u16) -> Game {
-        Game { year, delivered: 0, tips: 0, job: None, toast: None, rng: ChaCha8Rng::seed_from_u64(seed ^ 0xDE11) }
+        Game {
+            year,
+            delivered: 0,
+            tips: 0,
+            job: None,
+            toast: None,
+            rng: ChaCha8Rng::seed_from_u64(seed ^ 0xDE11 ^ year as u64),
+            seed,
+            seen: Default::default(),
+            clean: 0,
+            job_helped: false,
+            met: vec![],
+            understood: false,
+        }
+    }
+
+    pub fn save(&self) -> Save {
+        let mut seen: Vec<Cell> = self.seen.iter().copied().collect();
+        seen.sort_unstable();
+        Save { seed: self.seed, year: self.year, delivered: self.delivered, tips: self.tips, clean: self.clean, seen, met: self.met.clone() }
+    }
+
+    pub fn load(s: Save) -> Game {
+        let mut g = Game::new(s.seed, s.year);
+        g.delivered = s.delivered;
+        g.tips = s.tips;
+        g.clean = s.clean;
+        g.seen = s.seen.into_iter().collect();
+        g.met = s.met;
+        g
+    }
+
+    /// Mark what's around you as seen (a few metres; further from rooftops).
+    pub fn observe(&mut self, city: &City, feet: Vec3) {
+        let r = if feet.y > 3.0 && place_is_roof(city, self.year, feet) { 5 } else { 2 };
+        let (ci, cj) = ((feet.x / C).floor() as i32, (feet.z / C).floor() as i32);
+        for dj in -r..=r {
+            for di in -r..=r {
+                let (i, j) = (ci + di, cj + dj);
+                if city.in_bounds(i, j) {
+                    self.seen.insert((i as u16, j as u16));
+                }
+            }
+        }
+    }
+
+    /// Share of this era's lanes you've walked.
+    pub fn coverage(&self, city: &City) -> f32 {
+        let lanes: Vec<Cell> = (0..city.w * city.d).filter(|&k| city.ground[k] == Ground::Alley).map(|k| ((k % city.w) as u16, (k / city.w) as u16)).collect();
+        lanes.iter().filter(|c| self.seen.contains(c)).count() as f32 / lanes.len().max(1) as f32
+    }
+
+    pub fn knows_era(&self, city: &City) -> bool {
+        self.clean >= KNOW_CLEAN && self.coverage(city) >= KNOW_COVERAGE
+    }
+
+    pub fn next_era(&self) -> Option<u16> {
+        ERAS.iter().copied().find(|&e| e > self.year)
+    }
+
+    /// Move on to `year`. What was rebuilt since is blank in the notebook again.
+    pub fn enter_era(&mut self, city: &City, year: u16) {
+        let old = self.year;
+        self.seen.retain(|&c| city.height_at(c, old) == city.height_at(c, year));
+        self.year = year;
+        self.clean = 0;
+        self.job = None;
+        self.job_helped = false;
+        self.understood = false;
+        self.rng = ChaCha8Rng::seed_from_u64(self.seed ^ 0xDE11 ^ year as u64);
+        self.toast(format!("{year}. The city has grown; your notebook is out of date."));
     }
 
     /// Offer a new job: collect from a business, take it to a household or another business.
@@ -208,6 +322,20 @@ impl Game {
             let name = job.to_name.clone();
             self.delivered += 1;
             self.tips += tip;
+            if let Some(&o) = soc.occupants(u, self.year).first() {
+                let (kind, id) = match o {
+                    Occupant::Household(h) => (0, h),
+                    Occupant::Business(b) => (1, b),
+                    Occupant::Temple => (2, 0),
+                };
+                if kind < 2 && !self.met.iter().any(|m| m.kind == kind && m.id == id) {
+                    self.met.push(Met { kind, id, unit: u, year: self.year });
+                }
+            }
+            if !self.job_helped {
+                self.clean += 1;
+            }
+            self.job_helped = false;
             self.job = None;
             self.toast(format!("Delivered to {name}. Tip: HK${tip}."));
             self.new_job(city, soc);
@@ -303,6 +431,14 @@ pub fn plates(city: &City, soc: &Society, year: u16) -> Vec<Plate> {
         });
     }
     out
+}
+
+fn place_is_roof(city: &City, year: u16, feet: Vec3) -> bool {
+    let (i, j) = ((feet.x / C).floor() as i32, (feet.z / C).floor() as i32);
+    city.in_bounds(i, j) && {
+        let c = (i as u16, j as u16);
+        city.ground_at(c) == Ground::Plot && feet.y + 0.3 >= city.height_at(c, year) as f32 * S
+    }
 }
 
 /// Is the straight line from `a` to `b` free of walls?

@@ -1334,6 +1334,8 @@ dependencies = [
  "log",
  "rand",
  "rand_chacha",
+ "serde",
+ "serde_json",
  "winit",
 ]
 

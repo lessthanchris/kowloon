@@ -280,7 +280,7 @@ fn value_noise(x: f32, y: f32, seed: u32) -> f32 {
 fn top_of(city: &City, c: Cell, year: u16, over: &HashMap<Cell, (f32, f32)>) -> f32 {
     match city.ground_at(c) {
         Ground::Plot => city.height_at(c, year) as f32 * S,
-        Ground::Yamen => crate::citymesh::YAMEN_H,
+        Ground::Yamen => crate::citymesh::yamen_height(city, c),
         Ground::Alley => over.get(&c).map_or(0.0, |o| o.1),
         _ => 0.0,
     }
@@ -309,7 +309,10 @@ pub fn build(city: &City, year: u16) -> (WalkWorld, MeshData) {
             let (x0, z0, x1, z1) = cell_rect(c);
             match city.ground_at(c) {
                 Ground::Yamen => {
-                    b.boxes.push(Aabb::new(Vec3::new(x0, 0.0, z0), Vec3::new(x1, crate::citymesh::YAMEN_H, z1)));
+                    let h = crate::citymesh::yamen_height(city, c);
+                    if h > 0.0 {
+                        b.boxes.push(Aabb::new(Vec3::new(x0, 0.0, z0), Vec3::new(x1, h, z1)));
+                    }
                 }
                 Ground::Alley => {
                     if let Some(&(y0, y1)) = over.get(&c) {
@@ -559,6 +562,73 @@ fn stairwell(b: &mut Builder, city: &City, plot: &Plot, h: i32) {
     b.mesh.ao = 1.0;
 }
 
+/// A box standing off the wall at face `d`: `o0`..`o1` metres out into the lane.
+fn out_box(c: Cell, d: Dir, a0: f32, a1: f32, y0: f32, y1: f32, o0: f32, o1: f32) -> Aabb {
+    let mut b = face_box_out(c, d, o1, a0, a1, y0, y1);
+    match d {
+        Dir::N => b.max.z -= o0,
+        Dir::S => b.min.z += o0,
+        Dir::E => b.min.x += o0,
+        Dir::W => b.max.x -= o0,
+    }
+    b
+}
+
+/// Dress a shopfront by its trade, so you can tell a noodle shop from a
+/// dentist at a glance.
+fn shopfront(b: &mut Builder, c: Cell, d: Dir, y: f32, trade: UnitUse, open: bool, r: f32, front: Aabb) {
+    use UnitUse::*;
+    let awning = match trade {
+        Restaurant => Some(srgb(170, 40, 30)),
+        Shop => Some(srgb(40, 110, 70)),
+        FishballFactory => Some(srgb(40, 80, 150)),
+        Dentist | Clinic => None,
+        _ => Some(srgb(120, 110, 90)),
+    };
+    if let Some(col) = awning {
+        b.visual(out_box(c, d, 0.05, C - 0.05, y + 2.48, y + 2.56, 0.0, 0.7), col, 0.0, ALL);
+    }
+    let lit_warm = srgb(255, 214, 160);
+    match trade {
+        Restaurant => {
+            b.visual(front, lit_warm, if open { 1.0 } else { 0.4 }, only(d));
+            // Roast ducks and pork hanging in the window.
+            for k in 0..4 {
+                let a = 0.25 + k as f32 * 0.28;
+                b.visual(out_box(c, d, a, a + 0.14, y + 1.75, y + 2.2, 0.08, 0.2), srgb(170, 80, 30), 0.15, ALL);
+            }
+        }
+        Shop => {
+            let col = if open { lit_warm } else { srgb(120, 124, 126) };
+            b.visual(front, col, if open { 0.9 } else { 0.0 }, only(d));
+            // Sacks of rice and crates by the door.
+            b.visual(out_box(c, d, 0.1, 0.5, y, y + 0.45, 0.05, 0.4), srgb(225, 215, 190), 0.0, ALL);
+            b.visual(out_box(c, d, 1.0, 1.4, y, y + 0.35, 0.05, 0.4), srgb(130, 90, 50), 0.0, ALL);
+            b.visual(out_box(c, d, 1.05, 1.35, y + 0.35, y + 0.65, 0.08, 0.37), srgb(140, 100, 55), 0.0, ALL);
+        }
+        FishballFactory => {
+            b.visual(front, srgb(205, 220, 225), if open { 0.5 } else { 0.1 }, only(d));
+            b.visual(out_box(c, d, 0.15, 0.45, y, y + 0.4, 0.05, 0.35), srgb(40, 80, 170), 0.0, ALL);
+            b.visual(out_box(c, d, 0.55, 0.85, y, y + 0.4, 0.05, 0.35), srgb(40, 80, 170), 0.0, ALL);
+        }
+        Dentist | Clinic => {
+            b.visual(front, srgb(225, 238, 245), if open { 0.55 } else { 0.25 }, only(d));
+            // A red cross in the window (the name goes on the fascia above).
+            b.visual(out_box(c, d, 0.55, 0.95, y + 1.7, y + 1.82, 0.03, 0.06), srgb(220, 30, 30), 0.8, ALL);
+            b.visual(out_box(c, d, 0.69, 0.81, y + 1.56, y + 1.96, 0.03, 0.06), srgb(220, 30, 30), 0.8, ALL);
+        }
+        _ => {
+            // Workshops: shutter half down, the work lit orange beneath it.
+            let mut top = front;
+            let mut bottom = front;
+            top.min.y = y + 1.3;
+            bottom.max.y = y + 1.3;
+            b.visual(top, srgb(110, 114, 116), 0.0, only(d));
+            b.visual(bottom, srgb(255, 170, 80), if open || r < 0.6 { 0.9 } else { 0.0 }, only(d));
+        }
+    }
+}
+
 /// Unit doors (metal gates) on corridors, and shopfronts on the lanes.
 fn unit_doors(b: &mut Builder, city: &City, year: u16) {
     for u in city.units_at(year) {
@@ -579,11 +649,8 @@ fn unit_doors(b: &mut Builder, city: &City, year: u16) {
                     let lantern = face_box_out(c, d, 0.35, a, a + 0.2, y + 2.2, y + 2.55);
                     b.visual(lantern, srgb(255, 90, 40), 2.0, ALL);
                 }
-            } else if u.door_state == DoorState::Open {
-                let col = if r < 0.5 { srgb(255, 214, 160) } else { srgb(220, 255, 230) };
-                b.visual(front, col, 0.9, only(d));
             } else {
-                b.visual(front, srgb(120, 124, 126), 0.0, only(d));
+                shopfront(b, c, d, y, u.usage, u.door_state == DoorState::Open, r, front);
             }
         } else {
             b.mesh.ao = 0.12;
@@ -691,6 +758,64 @@ pub fn roof_furniture(city: &City, year: u16) -> (Vec<Piece>, Vec<Ladder>) {
                 if q != pid && city.height_at(n, year) > h && laddered.insert((pid.min(q), pid.max(q))) {
                     ladder_cells.insert((c, d));
                 }
+            }
+        }
+    }
+
+    // Rooftop life: aerials, water tanks, pigeon coops, pot gardens, laundry, shacks.
+    let keep_clear: std::collections::HashSet<Cell> = city.plots.iter().flat_map(|p| [p.core[0], p.core[5]]).collect();
+    // Keep clutter off the cells ladders stand on (either end).
+    let laddered_cells: std::collections::HashSet<Cell> =
+        ladder_cells.iter().flat_map(|&(c, d)| [Some(c), city.step(c, d)]).flatten().collect();
+    for p in city.plots.iter().filter(|p| p.height_at(year) > 0) {
+        let top = p.height_at(year) as f32 * S;
+        for &c in &p.cells {
+            if city.role_at(c) == Role::Stair || keep_clear.contains(&c) || laddered_cells.contains(&c) {
+                continue;
+            }
+            let (x0, z0, _, _) = cell_rect(c);
+            let (cx, cz) = (x0 + C / 2.0, z0 + C / 2.0);
+            let r = hash(c.0 as u32 * 13, c.1 as u32 * 7, 501);
+            let at = |dx: f32, dz: f32, w: f32, dd: f32, y0: f32, y1: f32| Aabb::new(Vec3::new(cx + dx - w / 2.0, top + y0, cz + dz - dd / 2.0), Vec3::new(cx + dx + w / 2.0, top + y1, cz + dz + dd / 2.0));
+            let metal = srgb(150, 150, 145);
+            if r < 0.16 {
+                // TV aerial: a pole and a few crossbars.
+                let h = 2.5 + hash(c.0 as u32, c.1 as u32, 502) * 2.5;
+                put(at(0.3, 0.2, 0.05, 0.05, 0.0, h), metal, false);
+                for k in 0..3 {
+                    let y = h - 0.3 - k as f32 * 0.45;
+                    put(at(0.3, 0.2, 1.1 - k as f32 * 0.2, 0.03, y, y + 0.03), metal, false);
+                }
+            } else if r < 0.21 {
+                // Water tank on legs.
+                for (lx, lz) in [(-0.4, -0.4), (0.4, -0.4), (-0.4, 0.4), (0.4, 0.4)] {
+                    put(at(lx, lz, 0.07, 0.07, 0.0, 0.6), metal, true);
+                }
+                put(at(0.0, 0.0, 1.0, 1.0, 0.6, 1.8), srgb(90, 110, 120), true);
+            } else if r < 0.225 {
+                // Pigeon coop: wooden frame, wire walls.
+                put(at(0.0, 0.0, 1.3, 1.3, 0.0, 1.4), srgb(60, 60, 58), true);
+                put(at(0.0, 0.0, 1.4, 1.4, 1.4, 1.5), srgb(120, 90, 60), true);
+            } else if r < 0.27 {
+                // Pot garden.
+                for k in 0..4 {
+                    let dx = -0.5 + k as f32 * 0.33;
+                    put(at(dx, 0.5, 0.25, 0.25, 0.0, 0.25), srgb(150, 80, 50), false);
+                    put(at(dx, 0.5, 0.3, 0.3, 0.25, 0.55 + hash(k, c.0 as u32, 3) * 0.3), srgb(60, 130, 60), false);
+                }
+            } else if r < 0.30 {
+                // Laundry line.
+                put(at(-0.6, 0.0, 0.04, 0.04, 0.0, 1.8), metal, false);
+                put(at(0.6, 0.0, 0.04, 0.04, 0.0, 1.8), metal, false);
+                put(at(0.0, 0.0, 1.2, 0.02, 1.78, 1.8), metal, false);
+                for k in 0..3 {
+                    let cols = [srgb(200, 60, 60), srgb(230, 230, 220), srgb(70, 110, 180)];
+                    put(at(-0.35 + k as f32 * 0.35, 0.0, 0.28, 0.02, 1.2, 1.78), cols[k], false);
+                }
+            } else if r < 0.32 {
+                // A tin shack.
+                put(at(0.0, 0.0, 1.2, 1.2, 0.0, 2.1), srgb(120, 118, 105), true);
+                put(at(0.0, 0.0, 1.36, 1.36, 2.1, 2.18), srgb(95, 90, 80), true);
             }
         }
     }

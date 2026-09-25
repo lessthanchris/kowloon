@@ -60,7 +60,7 @@ const SIGN_COLS: &[[u8; 3]] = &[[255, 60, 70], [255, 90, 180], [80, 255, 140], [
 
 /// Each main lane and its side alleys share a colour: their lamps and most of
 /// their signs, so "the red alleys" come to mean somewhere.
-const FAMILY: &[[u8; 3]] = &[
+pub const FAMILY: &[[u8; 3]] = &[
     [255, 70, 60],   // red
     [255, 180, 60],  // amber
     [90, 255, 150],  // green
@@ -212,6 +212,20 @@ pub fn landmarks(city: &City) -> Vec<Fixture> {
                 out.push(Fixture { aabb: Aabb::new(Vec3::new(cx - r, 1.95, cz - 0.04), Vec3::new(cx + r, 2.03, cz + 0.04)), col: srgb(110, 80, 50), emit: 0.0 });
             }
             _ => {}
+        }
+    }
+    // Two old trees in the Yamen's front courtyard.
+    let yard: Vec<Cell> = (0..city.w * city.d)
+        .filter(|&k| city.ground[k] == Ground::Yamen)
+        .map(|k| ((k % city.w) as u16, (k / city.w) as u16))
+        .filter(|&c| crate::citymesh::yamen_part(city, c) == crate::citymesh::YamenPart::Yard && city.neighbours(c).all(|(_, n)| city.ground_at(n) == Ground::Yamen))
+        .collect();
+    if let Some(&south) = yard.iter().max_by_key(|c| c.1) {
+        for dx in [-2i32, 2] {
+            let (cx, cz) = ((south.0 as i32 + dx) as f32 * C + C / 2.0, south.1 as f32 * C);
+            out.push(Fixture { aabb: Aabb::new(Vec3::new(cx - 0.15, 0.0, cz - 0.15), Vec3::new(cx + 0.15, 3.0, cz + 0.15)), col: srgb(80, 60, 40), emit: 0.0 });
+            out.push(Fixture { aabb: Aabb::new(Vec3::new(cx - 1.6, 3.0, cz - 1.6), Vec3::new(cx + 1.6, 5.8, cz + 1.6)), col: srgb(50, 100, 50), emit: 0.0 });
+            out.push(Fixture { aabb: Aabb::new(Vec3::new(cx - 1.1, 5.8, cz - 1.1), Vec3::new(cx + 1.1, 6.8, cz + 1.1)), col: srgb(60, 115, 55), emit: 0.0 });
         }
     }
     out

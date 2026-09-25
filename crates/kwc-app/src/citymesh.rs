@@ -65,8 +65,46 @@ pub const YAMEN_H: f32 = 4.5;
 fn col_height(city: &City, c: Cell, year: u16) -> f32 {
     match city.ground_at(c) {
         Ground::Plot => city.height_at(c, year) as f32 * STOREY_M,
-        Ground::Yamen => YAMEN_H,
+        Ground::Yamen => yamen_height(city, c),
         _ => 0.0,
+    }
+}
+
+#[derive(Clone, Copy, PartialEq, Eq)]
+pub enum YamenPart {
+    Hall,
+    Wall,
+    Yard,
+}
+
+/// The Yamen compound: three low halls across its long axis, courtyards
+/// between them, a boundary wall with a gate at the south end.
+pub fn yamen_part(city: &City, c: Cell) -> YamenPart {
+    static BOX: std::sync::OnceLock<(i32, i32, i32, i32)> = std::sync::OnceLock::new();
+    let &(i0, i1, j0, j1) = BOX.get_or_init(|| {
+        let cells: Vec<Cell> = (0..city.w * city.d).filter(|&k| city.ground[k] == Ground::Yamen).map(|k| ((k % city.w) as u16, (k / city.w) as u16)).collect();
+        let f = |g: fn(&Cell) -> u16| cells.iter().map(g).collect::<Vec<u16>>();
+        let (is, js) = (f(|c| c.0), f(|c| c.1));
+        (*is.iter().min().unwrap() as i32, *is.iter().max().unwrap() as i32, *js.iter().min().unwrap() as i32, *js.iter().max().unwrap() as i32)
+    });
+    let (i, j) = (c.0 as i32, c.1 as i32);
+    let edge = city.neighbours(c).any(|(_, n)| city.ground_at(n) != Ground::Yamen) || city.neighbours(c).count() < 4;
+    let mid_i = (i0 + i1) / 2;
+    if edge {
+        // The gate: a two-cell gap in the south wall.
+        return if j >= j1 - 1 && (i - mid_i).abs() <= 1 { YamenPart::Yard } else { YamenPart::Wall };
+    }
+    let len = (j1 - j0 + 1) as f32;
+    let r = (j - j0) as f32 / len;
+    let hall = [(0.12, 0.30), (0.44, 0.60), (0.72, 0.84)].iter().any(|&(a, b)| r >= a && r < b);
+    if hall { YamenPart::Hall } else { YamenPart::Yard }
+}
+
+pub fn yamen_height(city: &City, c: Cell) -> f32 {
+    match yamen_part(city, c) {
+        YamenPart::Hall => YAMEN_H,
+        YamenPart::Wall => 1.8,
+        YamenPart::Yard => 0.0,
     }
 }
 
@@ -144,6 +182,7 @@ pub fn build(city: &City, year: u16, mode: ColourMode) -> MeshData {
 
             if h <= 0.0 {
                 let col = match g {
+                    Ground::Yamen => srgb(120, 112, 98), // stone-paved courtyard
                     Ground::Alley => srgb(46, 46, 48),
                     Ground::Well => srgb(30, 32, 34),
                     _ => srgb(58, 62, 44), // empty plot: scrub and huts' footprints
@@ -159,7 +198,8 @@ pub fn build(city: &City, year: u16, mode: ColourMode) -> MeshData {
             }
 
             let (base, roof) = match g {
-                Ground::Yamen => (srgb(118, 108, 98), srgb(70, 58, 52)),
+                Ground::Yamen if yamen_part(city, c) == YamenPart::Wall => (srgb(140, 130, 116), srgb(110, 100, 90)),
+                Ground::Yamen => (srgb(150, 60, 45), srgb(60, 66, 70)), // red walls, grey tile roofs
                 _ => {
                     let p = city.plot_at(c).unwrap();
                     let b = match mode {
