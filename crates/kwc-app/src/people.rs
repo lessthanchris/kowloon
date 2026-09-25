@@ -179,11 +179,49 @@ impl Frame {
 
 fn figure_mesh(m: &mut MeshData, f: &Figure, t: f32, detail: bool) {
     let (pos, yaw, _) = f.at();
+    let walking = f.pose == Pose::Walk && f.path.len() > 1;
+    body_mesh(m, f, pos, yaw, walking, f.s, t, detail);
+}
+
+/// Your best run, walking the course beside you: a pale, faintly glowing
+/// courier. `stride` is how far it has walked (it sets the legs going).
+pub fn ghost_mesh(m: &mut MeshData, pos: Vec3, yaw: f32, stride: f32, walking: bool, t: f32) {
+    let f = Figure {
+        name: String::new(),
+        about: String::new(),
+        scale: 1.0,
+        stoop: 0.03,
+        top: srgb(150, 215, 255),
+        bottom: srgb(90, 150, 220),
+        skin: srgb(200, 235, 255),
+        hair: srgb(120, 180, 230),
+        long_hair: false,
+        pose: if walking { Pose::Walk } else { Pose::Stand },
+        prop: Prop::Bag,
+        path: vec![pos],
+        cum: vec![0.0],
+        yaw,
+        s: stride,
+        dir: 1.0,
+        speed: 0.0,
+        light: vec![Vec3::ZERO],
+        ao: 1.0,
+        day_only: false,
+    };
+    let from = m.vertices.len();
+    body_mesh(m, &f, pos, yaw, walking, stride, t, true);
+    for v in &mut m.vertices[from..] {
+        // Keeps its colour by day, glows a little at night.
+        v.emit = -0.6;
+    }
+}
+
+#[allow(clippy::too_many_arguments)]
+fn body_mesh(m: &mut MeshData, f: &Figure, pos: Vec3, yaw: f32, walking: bool, stride: f32, t: f32, detail: bool) {
     let fwd = Vec3::new(yaw.cos(), 0.0, yaw.sin());
     let rot = Mat3::from_cols(Vec3::Y.cross(fwd), Vec3::Y, fwd) * f.scale;
     let root = Frame { o: pos, m: rot };
-    let walking = f.pose == Pose::Walk && f.path.len() > 1;
-    let phase = if walking { f.s * 3.2 } else { 0.0 };
+    let phase = if walking { stride * 3.2 } else { 0.0 };
     let swing = if walking { phase.sin() * 0.45 } else { 0.0 };
     // A little life when still: breathing, shifting weight.
     let idle = if walking { 0.0 } else { (t * 0.9 + f.cum.len() as f32 + pos.x).sin() * 0.03 };

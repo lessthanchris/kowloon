@@ -567,6 +567,7 @@ impl App {
                 w.crowd.update(TICK, w.player.pos);
                 if let Some(r) = self.race.as_mut() {
                     r.tick(input.forward != 0.0 || input.strafe != 0.0);
+                    r.record(w.player.pos, w.player.yaw);
                 }
             }
             match act {
@@ -663,9 +664,15 @@ impl App {
         // The Kai Tak jet, rebuilt where it is this frame.
         let t = self.started.elapsed().as_secs_f32();
         self.plane = plane::mesh(t, citymesh::centre(&self.world.city)).and_then(|m| GpuMesh::upload(&run.gpu.device, &m));
+        let race = self.race.as_ref();
         self.people = self.walk.as_ref().and_then(|w| {
             let cam = w.player.camera();
-            GpuMesh::upload(&run.gpu.device, &w.crowd.mesh(cam.eye, (cam.target - cam.eye).normalize(), s.night, t))
+            let mut m = w.crowd.mesh(cam.eye, (cam.target - cam.eye).normalize(), s.night, t);
+            // Your best run, racing you.
+            if let Some(g) = race.and_then(|r| r.ghost.as_ref().map(|g| (g, r.ticks))).map(|(g, ticks)| g.at(ticks)) {
+                people::ghost_mesh(&mut m, g.0, g.1, g.2, g.3, t);
+            }
+            GpuMesh::upload(&run.gpu.device, &m)
         });
         let mut meshes: Vec<&GpuMesh> = self.world.mesh.iter().chain(self.plane.iter()).chain(self.people.iter()).collect();
         let params = match &self.walk {
@@ -1222,7 +1229,14 @@ fn screenshot(args: &[String], out: &str) {
         }
         meshes.extend(wk.interior.iter());
         let cam = p.camera();
-        people_mesh = GpuMesh::upload(&gpu.device, &wk.crowd.mesh(cam.eye, (cam.target - cam.eye).normalize(), night, 0.0));
+        let look = (cam.target - cam.eye).normalize();
+        let mut pm = wk.crowd.mesh(cam.eye, look, night, 0.0);
+        // `--ghost`: a ghost courier a few steps ahead, mid-stride (to check how it looks).
+        if args.iter().any(|a| a == "--ghost") {
+            let at = Vec3::new(cam.eye.x + look.x * 3.5, p.pos.y, cam.eye.z + look.z * 3.5);
+            people::ghost_mesh(&mut pm, at, p.yaw + 0.4, 0.4, true, 0.0);
+        }
+        people_mesh = GpuMesh::upload(&gpu.device, &pm);
         meshes.extend(people_mesh.iter());
         walk_params(&cam, gpu.aspect(), night, args.iter().any(|a| a == "--torch"))
     } else {

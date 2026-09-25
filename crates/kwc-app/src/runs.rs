@@ -6,11 +6,75 @@ use crate::course::Course;
 use crate::TICK;
 use egui::{Align2, Color32, FontId, RichText};
 use serde::{Deserialize, Serialize};
+use glam::Vec3;
 use std::collections::HashMap;
 
 /// Deliveries in a run.
 pub const DELIVERIES: usize = 5;
 const RECORDS: &str = "runs.json";
+/// A ghost keeps where you were every few ticks (30 a second), and is drawn
+/// smoothly between.
+const EVERY: u32 = 4;
+const GHOSTS: &str = "ghosts";
+
+/// Where you were through a run: position and heading every `EVERY` ticks.
+#[derive(Serialize, Deserialize, Default, Clone)]
+pub struct Ghost {
+    pts: Vec<[f32; 4]>,
+    /// Distance walked to each point (for the legs), filled in on load.
+    #[serde(skip)]
+    walked: Vec<f32>,
+}
+
+impl Ghost {
+    fn file(course: Course, cat: Category) -> std::path::PathBuf {
+        std::path::Path::new(GHOSTS).join(format!("{}_{}.json", course.code(), cat.name()))
+    }
+
+    fn load(course: Course, cat: Category) -> Option<Ghost> {
+        let g: Ghost = serde_json::from_str(&std::fs::read_to_string(Ghost::file(course, cat)).ok()?).ok()?;
+        (!g.pts.is_empty()).then(|| g.measured())
+    }
+
+    fn save(&self, course: Course, cat: Category) {
+        if cfg!(test) {
+            return;
+        }
+        let _ = std::fs::create_dir_all(GHOSTS);
+        if let Ok(json) = serde_json::to_string(self) {
+            let _ = std::fs::write(Ghost::file(course, cat), json);
+        }
+    }
+
+    fn measured(mut self) -> Ghost {
+        let mut d = 0.0;
+        self.walked = self
+            .pts
+            .windows(2)
+            .map(|w| {
+                d += Vec3::new(w[1][0] - w[0][0], 0.0, w[1][2] - w[0][2]).length();
+                d
+            })
+            .collect();
+        self.walked.insert(0, 0.0);
+        self
+    }
+
+    /// Where the ghost is `ticks` into the run: position, heading, distance
+    /// walked, and whether it's moving.
+    pub fn at(&self, ticks: u32) -> (Vec3, f32, f32, bool) {
+        let n = self.pts.len();
+        let k = ticks as f32 / EVERY as f32;
+        let i = (k.floor() as usize).min(n - 1);
+        let j = (i + 1).min(n - 1);
+        let f = if i == j { 0.0 } else { k - i as f32 };
+        let (a, b) = (self.pts[i], self.pts[j]);
+        let pos = Vec3::new(a[0], a[1], a[2]).lerp(Vec3::new(b[0], b[1], b[2]), f);
+        let turn = (b[3] - a[3] + std::f32::consts::PI).rem_euclid(std::f32::consts::TAU) - std::f32::consts::PI;
+        let walked = self.walked[i] + (self.walked[j] - self.walked[i]) * f;
+        (pos, a[3] + turn * f, walked, self.walked[j] - self.walked[i] > 0.02)
+    }
+}
 
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
 pub enum Category {
@@ -68,11 +132,16 @@ pub struct Run {
     pub splits: Vec<u32>,
     best: Option<Vec<u32>>,
     pub new_best: bool,
+    /// This run's trace, and the best run's ghost.
+    trace: Ghost,
+    pub ghost: Option<Ghost>,
 }
 
 impl Run {
     pub fn new(course: Course, cat: Category, records: &Records) -> Run {
-        Run { course, cat, ticks: 0, started: false, splits: vec![], best: records.best(course, cat).cloned(), new_best: false }
+        let best = records.best(course, cat).cloned();
+        let ghost = best.as_ref().and_then(|_| Ghost::load(course, cat));
+        Run { course, cat, ticks: 0, started: false, splits: vec![], best, new_best: false, trace: Ghost::default(), ghost }
     }
 
     pub fn finished(&self) -> bool {
@@ -87,6 +156,20 @@ impl Run {
         }
     }
 
+    /// Where you are this tick (after `tick`): kept every few ticks for the
+    /// ghost. Point 0 is where you stood when the clock started.
+    pub fn record(&mut self, pos: Vec3, yaw: f32) {
+        if self.finished() {
+            return;
+        }
+        let p = [pos.x, pos.y, pos.z, yaw];
+        if !self.started {
+            self.trace.pts = vec![p];
+        } else if self.ticks % EVERY == 0 {
+            self.trace.pts.push(p);
+        }
+    }
+
     /// A delivery made: record the split, and the run if it's a new best.
     pub fn split(&mut self, records: &mut Records) {
         if self.finished() {
@@ -97,6 +180,7 @@ impl Run {
             self.new_best = true;
             records.best.insert(key(self.course, self.cat), self.splits.clone());
             records.save();
+            self.trace.save(self.course, self.cat);
         }
     }
 
@@ -190,5 +274,27 @@ mod tests {
         r.tick(true);
         assert_eq!(r.ticks, t, "the clock stops at the last delivery");
         assert_eq!(clock(120 * 65 + 30), "1:05.25");
+    }
+
+    #[test]
+    fn ghost_follows_the_recorded_run() {
+        let course = Course { seed: 2, era: 1950 };
+        let mut records = Records::default();
+        let mut r = Run::new(course, Category::Rounds, &records);
+        r.record(Vec3::ZERO, 0.0);
+        // Walk east at 2 m/s for 3 s.
+        for k in 1..=360 {
+            r.tick(true);
+            r.record(Vec3::new(k as f32 * 2.0 * TICK, 0.0, 0.0), 0.0);
+        }
+        for _ in 0..DELIVERIES {
+            r.split(&mut records);
+        }
+        let g = r.trace.clone().measured();
+        let (p, _, walked, moving) = g.at(180);
+        assert!((p.x - 3.0).abs() < 0.05, "halfway along: {p:?}");
+        assert!((walked - 3.0).abs() < 0.05 && moving);
+        let (end, _, _, still) = g.at(10_000);
+        assert!((end.x - 6.0).abs() < 0.05 && !still, "waits at the end: {end:?}");
     }
 }
