@@ -197,6 +197,7 @@ impl Player {
         false
     }
 
+    #[cfg(test)]
     pub fn is_vaulting(&self) -> bool {
         self.vault.is_some()
     }

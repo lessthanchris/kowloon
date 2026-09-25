@@ -40,6 +40,22 @@ fn every_unit_reachable_every_era() {
     }
 }
 
+/// Course codes carry any 16-bit seed, so any seed must make a sound city:
+/// within the cap, the Yamen clear, every door reachable in every era.
+#[test]
+fn course_seeds_make_sound_cities() {
+    for seed in (0..12u64).map(|k| (k * 5471 + 17) & 0xFFFF) {
+        let c = city(seed);
+        assert!(c.plots.iter().all(|p| p.final_height() as usize <= MAX_FLOORS), "seed {seed}: over the cap");
+        assert!(c.ground.iter().enumerate().all(|(k, g)| *g != Ground::Yamen || c.plot_of[k] == NO_PLOT), "seed {seed}: Yamen built on");
+        for year in [START_YEAR, 1965, END_YEAR] {
+            let bad = walk::unreachable_units(&c, year);
+            assert!(bad.is_empty(), "seed {seed} year {year}: {} unreachable units", bad.len());
+        }
+        assert!(c.units_at(END_YEAR).count() > 1000, "seed {seed}: a thin city");
+    }
+}
+
 #[test]
 fn timeline_never_loses_floors() {
     let c = city(3);

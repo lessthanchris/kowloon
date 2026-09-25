@@ -7,6 +7,7 @@
 
 mod autopilot;
 mod citymesh;
+mod course;
 mod game;
 mod lighting;
 mod lights;
@@ -54,6 +55,8 @@ struct Settings {
     demo_status: Option<String>,
     /// Frames wait for the display (V toggles).
     vsync: bool,
+    /// The course code, when racing one.
+    course: Option<String>,
 }
 
 struct World {
@@ -816,6 +819,9 @@ fn hud(ui: &mut egui::Ui, w: &Walk, s: &Settings, g: Option<&game::Game>, info: 
             egui::Frame::new().fill(Color32::from_rgba_unmultiplied(20, 18, 16, 225)).inner_margin(12.0).corner_radius(4.0).show(ui, |ui| {
                 ui.set_max_width(360.0);
                 ui.colored_label(paper, egui::RichText::new(format!("{} · Delivered {} · Tips HK${}", g.year, g.delivered, g.tips)).small());
+                if let Some(code) = &s.course {
+                    ui.colored_label(Color32::from_rgb(150, 200, 255), egui::RichText::new(format!("Course {code}")).small().monospace());
+                }
                 if let Some((cov, clean, knows, next)) = progress {
                     let line = if knows {
                         match next {
@@ -1079,7 +1085,28 @@ fn main() {
         screenshot(&args, &out);
         return;
     }
-    let world = World::new(1987);
+    // A course (`--code KWC-1965-7F3A`, `--daily`, `--random`): its own city,
+    // era and delivery list, always from the start.
+    let course = if let Some(c) = arg::<String>(&args, "--code") {
+        match course::Course::parse(&c) {
+            Some(c) => Some(c),
+            None => {
+                eprintln!("Not a course code: {c} (they look like KWC-1965-7F3A)");
+                return;
+            }
+        }
+    } else if args.iter().any(|a| a == "--daily") {
+        Some(course::Course::daily())
+    } else if args.iter().any(|a| a == "--random") {
+        Some(course::Course::random())
+    } else {
+        None
+    };
+    if let Some(c) = course {
+        println!("Course {}", c.code());
+    }
+    let seed = course.map_or(1987, |c| c.seed as u64);
+    let world = World::new(seed);
     let orbit = default_orbit(&world.city);
     // Default: the delivery game, on foot in 1950. `--walk`: roam 1987 freely.
     // `--free`: the growth overview.
@@ -1087,23 +1114,28 @@ fn main() {
     let overview = args.iter().any(|a| a == "--free");
     let walk_now = !overview;
     // `--era 1970`: try a later era, with its own save so the real one is untouched.
-    let era = arg::<u16>(&args, "--era").map(|y| game::ERAS.iter().copied().filter(|&e| e <= y.max(START_YEAR)).last().unwrap_or(START_YEAR));
-    let save_file = era.map_or(SAVE_FILE.to_string(), |e| format!("save-{e}.json"));
-    // Carry on from the save unless asked for a fresh start (--new).
-    let saved = (!args.iter().any(|a| a == "--new"))
+    let era = course.map(|c| c.era).or_else(|| arg::<u16>(&args, "--era").map(|y| game::ERAS.iter().copied().filter(|&e| e <= y.max(START_YEAR)).last().unwrap_or(START_YEAR)));
+    let save_file = match (course, era) {
+        (Some(c), _) => format!("save-{}.json", c.code()),
+        (None, Some(e)) => format!("save-{e}.json"),
+        _ => SAVE_FILE.to_string(),
+    };
+    // Carry on from the save unless asked for a fresh start (--new); a
+    // course always starts from the beginning.
+    let saved = (!args.iter().any(|a| a == "--new") && course.is_none())
         .then(|| std::fs::read_to_string(&save_file).ok())
         .flatten()
         .and_then(|s| serde_json::from_str::<game::Save>(&s).ok());
     let game = (!free_walk && !overview).then(|| match saved {
         Some(s) => game::Game::load(s),
-        None => game::Game::new(1987, era.unwrap_or(START_YEAR)),
+        None => game::Game::new(seed, era.unwrap_or(START_YEAR)),
     });
     let start_year = game.as_ref().map_or(START_YEAR, |g| g.year);
     let mut app = App {
         run: None,
         world,
         settings: Settings {
-            seed: 1987,
+            seed,
             year: if free_walk { END_YEAR as f32 } else { start_year as f32 },
             playing: !walk_now,
             speed: 2.0,
@@ -1118,6 +1150,7 @@ fn main() {
             ledger_pick: None,
             demo_status: None,
             vsync: true,
+            course: course.map(|c| c.code()),
         },
         orbit,
         walk: None,
@@ -1434,6 +1467,27 @@ mod tests {
             }
         }
         assert!(vaulted >= 3, "only {vaulted} vaults over 1950 clutter");
+    }
+
+    /// A course code fixes the whole course: the same deliveries in the same
+    /// order every time, and a different seed gives a different city and list.
+    #[test]
+    fn same_code_same_course() {
+        let jobs = |code: &str| {
+            let c = course::Course::parse(code).unwrap();
+            let city = generate(&Params { seed: c.seed as u64, ..Default::default() });
+            let soc = kwc_sim::society::generate(&city);
+            let mut g = game::Game::new(c.seed as u64, c.era);
+            (0..10)
+                .map(|_| {
+                    g.new_job(&city, &soc);
+                    let j = g.job.take().unwrap();
+                    (j.from, j.to, j.item)
+                })
+                .collect::<Vec<_>>()
+        };
+        assert_eq!(jobs("KWC-1965-7F3A"), jobs("kwc 1965 7f3a"));
+        assert_ne!(jobs("KWC-1965-7F3A"), jobs("KWC-1965-0042"));
     }
 
     /// A save from inside what is now a hut gets you out, not stuck.
