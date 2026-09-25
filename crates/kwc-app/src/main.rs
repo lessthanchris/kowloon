@@ -14,6 +14,7 @@ mod lights;
 mod panels;
 mod people;
 mod plane;
+mod runs;
 mod player;
 mod signtext;
 mod world;
@@ -57,6 +58,9 @@ struct Settings {
     vsync: bool,
     /// The course code, when racing one.
     course: Option<String>,
+    /// Title screen: the code typed in, and the run category chosen.
+    title_code: String,
+    memory_run: bool,
 }
 
 struct World {
@@ -173,6 +177,13 @@ struct App {
     autopilot: Option<autopilot::Autopilot>,
     /// Where the game saves (a trial of another era keeps its own).
     save_file: String,
+    /// The title screen is up (the city turns slowly behind it).
+    title: bool,
+    /// What the campaign save holds, for the title's Continue button.
+    save_summary: Option<String>,
+    /// A run in progress, and personal bests.
+    race: Option<runs::Run>,
+    records: runs::Records,
     started: Instant,
     plane: Option<GpuMesh>,
     /// Everyone near you, posed for this frame.
@@ -229,6 +240,10 @@ impl ApplicationHandler for App {
                 if event.state == ElementState::Pressed {
                     if !event.repeat {
                         match code {
+                            // On the title screen, keys are for typing a code.
+                            _ if self.title => {}
+                            // No bird's-eye view mid-race.
+                            KeyCode::Tab if self.race.is_some() => {}
                             KeyCode::Tab => {
                                 if walking {
                                     self.leave_walk();
@@ -236,7 +251,12 @@ impl ApplicationHandler for App {
                                     self.settings.want_walk = true;
                                 }
                             }
-                            KeyCode::Escape if walking => self.leave_walk(),
+                            KeyCode::Escape if !self.title => self.to_title(),
+                            KeyCode::KeyR if self.race.is_some() && walking => self.restart_run(),
+                            // Races are on your own feet and in their own era, and a
+                            // Memory race means no help at all.
+                            KeyCode::KeyP | KeyCode::KeyY if self.race.is_some() => {}
+                            KeyCode::KeyG | KeyCode::KeyM | KeyCode::KeyL if self.race.as_ref().is_some_and(|r| r.cat == runs::Category::Memory) => {}
                             KeyCode::KeyT => self.settings.torch = !self.settings.torch,
                             KeyCode::KeyN => self.settings.night = !self.settings.night,
                             KeyCode::KeyV => {
@@ -321,6 +341,16 @@ impl ApplicationHandler for App {
 
 impl App {
     fn interact(&mut self) {
+        let before = self.game.as_ref().map_or(0, |g| g.delivered);
+        self.knock();
+        if self.game.as_ref().is_some_and(|g| g.delivered > before) {
+            if let Some(r) = self.race.as_mut() {
+                r.split(&mut self.records);
+            }
+        }
+    }
+
+    fn knock(&mut self) {
         let (Some(g), Some(w)) = (self.game.as_mut(), self.walk.as_mut()) else { return };
         // Whoever lives there comes to the door.
         if let Some(u) = g.interact(&self.world.city, &self.world.society, &w.spots, w.player.pos) {
@@ -335,6 +365,10 @@ impl App {
     }
 
     fn save_game(&self) {
+        // Races aren't saved: they always start from the beginning.
+        if self.race.is_some() {
+            return;
+        }
         if let Some(g) = &self.game {
             let mut save = g.save();
             save.pos = self.walk.as_ref().or(self.parked.as_ref()).filter(|w| w.year == g.year).map(|w| {
@@ -345,6 +379,70 @@ impl App {
                 let _ = std::fs::write(&self.save_file, json);
             }
         }
+    }
+
+    /// Back to the title screen (the campaign is saved; a race is dropped).
+    fn to_title(&mut self) {
+        self.save_game();
+        self.walk = None;
+        self.parked = None;
+        self.race = None;
+        self.autopilot = None;
+        self.pending_era = None;
+        self.settings.map_open = false;
+        self.settings.ledger_open = false;
+        self.settings.playing = false;
+        self.title = true;
+        self.save_summary = campaign_summary();
+        self.keys.clear();
+        self.sync_cursor();
+    }
+
+    fn use_city(&mut self, seed: u64) {
+        if self.world.city.params.seed != seed {
+            self.world = World::new(seed);
+        }
+        self.settings.seed = seed;
+        self.walk = None;
+        self.parked = None;
+    }
+
+    fn start_campaign(&mut self, fresh: bool) {
+        self.use_city(1987);
+        self.save_file = SAVE_FILE.to_string();
+        let saved = (!fresh).then(|| std::fs::read_to_string(SAVE_FILE).ok()).flatten().and_then(|s| serde_json::from_str::<game::Save>(&s).ok());
+        let g = saved.map_or_else(|| game::Game::new(1987, START_YEAR), game::Game::load);
+        self.settings.year = g.year as f32;
+        self.game = Some(g);
+        self.race = None;
+        self.settings.memory = false;
+        self.settings.course = None;
+        self.title = false;
+        self.settings.want_walk = true;
+    }
+
+    fn start_run(&mut self, course: course::Course, cat: runs::Category) {
+        self.use_city(course.seed as u64);
+        self.game = Some(game::Game::new(course.seed as u64, course.era));
+        self.settings.year = course.era as f32;
+        self.race = Some(runs::Run::new(course, cat, &self.records));
+        self.settings.memory = cat == runs::Category::Memory;
+        self.settings.help = false;
+        self.settings.course = None;
+        self.autopilot = None;
+        self.title = false;
+        self.settings.want_walk = true;
+    }
+
+    /// R: the same course again from the gate.
+    fn restart_run(&mut self) {
+        let Some(r) = self.race.as_ref() else { return };
+        let (course, cat) = (r.course, r.cat);
+        self.game = Some(game::Game::new(course.seed as u64, course.era));
+        if let Some(w) = self.walk.as_mut() {
+            w.player = player::Player::new(w.world.spawn, w.world.spawn_yaw);
+        }
+        self.race = Some(runs::Run::new(course, cat, &self.records));
     }
 
     fn sync_cursor(&self) {
@@ -467,6 +565,9 @@ impl App {
             if let Some(w) = self.walk.as_mut() {
                 w.player.update(&w.world, step, TICK);
                 w.crowd.update(TICK, w.player.pos);
+                if let Some(r) = self.race.as_mut() {
+                    r.tick(input.forward != 0.0 || input.strafe != 0.0);
+                }
             }
             match act {
                 autopilot::Act::Knock => self.interact(),
@@ -497,7 +598,7 @@ impl App {
                 if g.job.is_some() && (!self.settings.memory || self.settings.map_open || self.autopilot.is_some()) {
                     g.job_helped = true;
                 }
-                if !g.understood && g.knows_era(&self.world.city) {
+                if self.race.is_none() && !g.understood && g.knows_era(&self.world.city) {
                     g.understood = true;
                     let next = g.next_era().map_or("the end".to_string(), |n| n.to_string());
                     g.toast(format!("You know {}'s Walled City. Press Y to move on to {next}, or keep delivering.", g.year));
@@ -530,6 +631,9 @@ impl App {
             }
         }
 
+        if self.title {
+            self.orbit.yaw += dt * 0.04;
+        }
         let s = &mut self.settings;
         if s.playing {
             s.year += dt * s.speed;
@@ -582,9 +686,14 @@ impl App {
         let (city, soc) = (&self.world.city, &self.world.society);
         let progress = game.map(|g| (g.coverage(city), g.clean, g.knows_era(city), g.next_era()));
         let pending = self.pending_era;
+        let (title, race, records, summary) = (self.title, self.race.as_ref(), &self.records, self.save_summary.as_deref());
+        let mut action = None;
         let cmds = run.gui.draw(&run.gpu, &run.window, &mut enc, &view, |ui| match (walk, &info) {
             (Some(w), Some(info)) => {
                 hud(ui, w, s, game, info, fps, progress);
+                if let Some(r) = race {
+                    runs::hud(ui, r);
+                }
                 if let (true, Some(g)) = (s.map_open, game) {
                     panels::notebook(ui, city, soc, g, w.player.pos, w.player.yaw);
                 }
@@ -592,6 +701,7 @@ impl App {
                     panels::ledger(ui, soc, g, &mut s.ledger_pick);
                 }
             }
+            _ if title => action = title_screen(ui, s, records, summary),
             _ => {
                 panel(ui, s, &stats, fps);
                 if let Some(n) = pending {
@@ -608,7 +718,90 @@ impl App {
         run.gpu.queue.submit(cmds.into_iter().chain([enc.finish()]));
         run.window.pre_present_notify();
         run.gpu.queue.present(frame);
+        match action {
+            Some(TitleAction::Continue) => self.start_campaign(false),
+            Some(TitleAction::NewGame) => self.start_campaign(true),
+            Some(TitleAction::Race(c, cat)) => self.start_run(c, cat),
+            None => {}
+        }
     }
+}
+
+enum TitleAction {
+    Continue,
+    NewGame,
+    Race(course::Course, runs::Category),
+}
+
+/// What the campaign save holds, for the Continue button.
+fn campaign_summary() -> Option<String> {
+    let s = serde_json::from_str::<game::Save>(&std::fs::read_to_string(SAVE_FILE).ok()?).ok()?;
+    Some(format!("{} · {} delivered", s.year, s.delivered))
+}
+
+/// The title: carry on the campaign, or race a course.
+fn title_screen(ui: &mut egui::Ui, s: &mut Settings, records: &runs::Records, summary: Option<&str>) -> Option<TitleAction> {
+    use egui::{Align2, Color32, RichText};
+    let paper = Color32::from_rgb(236, 228, 208);
+    let dim = Color32::from_gray(160);
+    let mut act = None;
+    egui::Area::new(egui::Id::new("title")).anchor(Align2::CENTER_CENTER, [0.0, 0.0]).show(ui.ctx(), |ui| {
+        egui::Frame::new().fill(Color32::from_rgba_unmultiplied(16, 14, 12, 235)).inner_margin(28.0).corner_radius(8.0).show(ui, |ui| {
+            ui.set_width(440.0);
+            ui.vertical_centered(|ui| {
+                ui.colored_label(paper, RichText::new("KOWLOON WALLED CITY").size(30.0).strong());
+                ui.colored_label(dim, "1950 – 1987 · a courier's city");
+            });
+            ui.add_space(18.0);
+            ui.colored_label(Color32::from_rgb(255, 200, 90), RichText::new("Campaign").size(18.0));
+            ui.colored_label(dim, RichText::new("Deliver until you know the city, then watch it grow.").small());
+            ui.horizontal(|ui| {
+                if let Some(sum) = summary {
+                    if ui.button(format!("Continue ({sum})")).clicked() {
+                        act = Some(TitleAction::Continue);
+                    }
+                }
+                if ui.button(if summary.is_some() { "Start again" } else { "Start" }).clicked() {
+                    act = Some(TitleAction::NewGame);
+                }
+            });
+            ui.add_space(16.0);
+            ui.colored_label(Color32::from_rgb(120, 200, 255), RichText::new("Race").size(18.0));
+            ui.colored_label(dim, RichText::new(format!("{} deliveries against the clock. Same code, same city, same jobs.", runs::DELIVERIES)).small());
+            ui.horizontal(|ui| {
+                ui.radio_value(&mut s.memory_run, false, "Rounds (arrow and names)");
+                ui.radio_value(&mut s.memory_run, true, "Memory (plaques only)");
+            });
+            let cat = if s.memory_run { runs::Category::Memory } else { runs::Category::Rounds };
+            let best = |c: course::Course| records.best(c, cat).and_then(|b| b.last()).map_or(String::new(), |&t| format!(" · best {}", runs::clock(t)));
+            let daily = course::Course::daily();
+            ui.horizontal(|ui| {
+                if ui.button(format!("Today's course {}{}", daily.code(), best(daily))).clicked() {
+                    act = Some(TitleAction::Race(daily, cat));
+                }
+                if ui.button("Random").clicked() {
+                    act = Some(TitleAction::Race(course::Course::random(), cat));
+                }
+            });
+            ui.horizontal(|ui| {
+                ui.add(egui::TextEdit::singleline(&mut s.title_code).hint_text("KWC-1965-7F3A").desired_width(160.0).font(egui::TextStyle::Monospace));
+                let parsed = course::Course::parse(&s.title_code);
+                if ui.add_enabled(parsed.is_some(), egui::Button::new("Race this code")).clicked() {
+                    act = parsed.map(|c| TitleAction::Race(c, cat));
+                }
+                if let Some(c) = parsed {
+                    ui.colored_label(dim, RichText::new(best(c).trim_start_matches(" · ").to_string()).small());
+                } else if !s.title_code.trim().is_empty() {
+                    ui.colored_label(Color32::from_rgb(240, 120, 110), RichText::new("not a code").small());
+                }
+            });
+            ui.add_space(14.0);
+            ui.vertical_centered(|ui| {
+                ui.colored_label(dim, RichText::new("In game: Esc comes back here · R restarts a race · V vsync").small());
+            });
+        });
+    });
+    act
 }
 
 /// A name floating over a door, already projected to the screen.
@@ -822,7 +1015,7 @@ fn hud(ui: &mut egui::Ui, w: &Walk, s: &Settings, g: Option<&game::Game>, info: 
                 if let Some(code) = &s.course {
                     ui.colored_label(Color32::from_rgb(150, 200, 255), egui::RichText::new(format!("Course {code}")).small().monospace());
                 }
-                if let Some((cov, clean, knows, next)) = progress {
+                if let (Some((cov, clean, knows, next)), None) = (progress, &s.course) {
                     let line = if knows {
                         match next {
                             Some(n) => format!("You know this city. Y: move on to {n}"),
@@ -1112,7 +1305,7 @@ fn main() {
     // `--free`: the growth overview.
     let free_walk = args.iter().any(|a| a == "--walk");
     let overview = args.iter().any(|a| a == "--free");
-    let walk_now = !overview;
+    let walk_now = !overview && !args.iter().skip(1).all(|a| !a.starts_with("--"));
     // `--era 1970`: try a later era, with its own save so the real one is untouched.
     let era = course.map(|c| c.era).or_else(|| arg::<u16>(&args, "--era").map(|y| game::ERAS.iter().copied().filter(|&e| e <= y.max(START_YEAR)).last().unwrap_or(START_YEAR)));
     let save_file = match (course, era) {
@@ -1126,7 +1319,9 @@ fn main() {
         .then(|| std::fs::read_to_string(&save_file).ok())
         .flatten()
         .and_then(|s| serde_json::from_str::<game::Save>(&s).ok());
-    let game = (!free_walk && !overview).then(|| match saved {
+    // Plain launch: the title screen. Flags go straight in.
+    let title = !args.iter().skip(1).any(|a| a.starts_with("--"));
+    let game = (!free_walk && !overview && !title).then(|| match saved {
         Some(s) => game::Game::load(s),
         None => game::Game::new(seed, era.unwrap_or(START_YEAR)),
     });
@@ -1150,7 +1345,9 @@ fn main() {
             ledger_pick: None,
             demo_status: None,
             vsync: true,
-            course: course.map(|c| c.code()),
+            course: None,
+            title_code: String::new(),
+            memory_run: false,
         },
         orbit,
         walk: None,
@@ -1160,6 +1357,10 @@ fn main() {
         pending_era: None,
         autopilot: args.iter().any(|a| a == "--demo").then(autopilot::Autopilot::default),
         save_file,
+        title,
+        save_summary: campaign_summary(),
+        race: None,
+        records: runs::Records::load(),
         started: Instant::now(),
         plane: None,
         people: None,
@@ -1171,6 +1372,11 @@ fn main() {
         fps: 60.0,
         frames: 0,
     };
+    // A course from the command line is a race (`--memory` for the Memory category).
+    if let Some(c) = course {
+        let cat = if args.iter().any(|a| a == "--memory") { runs::Category::Memory } else { runs::Category::Rounds };
+        app.start_run(c, cat);
+    }
     let el = EventLoop::new().expect("event loop");
     el.run_app(&mut app).expect("run");
 }
