@@ -47,6 +47,7 @@ pub struct Player {
     eye_y: f32,
     prev_eye_y: f32,
     bob: f32,
+    prev_bob: f32,
     bob_amp: f32,
     dip: f32,
     dip_v: f32,
@@ -69,6 +70,7 @@ impl Player {
             eye_y: pos.y,
             prev_eye_y: pos.y,
             bob: 0.0,
+            prev_bob: 0.0,
             bob_amp: 0.0,
             dip: 0.0,
             dip_v: 0.0,
@@ -115,9 +117,12 @@ impl Player {
         let near = self.prev.distance(self.pos) < 2.0;
         let mut at = if near { self.prev.lerp(self.pos, self.alpha) } else { self.pos };
         at.y = if near { self.prev_eye_y + (self.eye_y - self.prev_eye_y) * self.alpha } else { self.eye_y };
-        // Head bob: a gentle rise and fall per step, a little sway per stride.
+        // Head bob: a soft rise and fall per step (a smooth cosine, no
+        // bounce at the bottom), the barest sway per stride; drawn between
+        // ticks like everything else.
+        let phase = self.prev_bob + (self.bob - self.prev_bob) * self.alpha;
         let side = Vec3::new(-self.yaw.sin(), 0.0, self.yaw.cos());
-        let bob = Vec3::Y * (self.bob_amp * (self.bob * 2.0).sin()) + side * (self.bob_amp * 0.5 * self.bob.sin());
+        let bob = Vec3::Y * (self.bob_amp * 0.5 * (1.0 - (phase * 2.0).cos())) + side * (self.bob_amp * 0.25 * phase.sin());
         let eye = at + Vec3::Y * (EYE - self.dip) + bob;
         let dir = Vec3::new(self.yaw.cos() * self.pitch.cos(), self.pitch.sin(), self.yaw.sin() * self.pitch.cos());
         Camera { eye, target: eye + dir, fov_y: self.fov.to_radians(), near: 0.05, far: 2500.0 }
@@ -152,10 +157,12 @@ impl Player {
         self.eye_y = if gap.abs() > 1.0 || self.climbing || !self.on_ground { self.pos.y } else { self.eye_y + gap * (dt * 16.0).min(1.0) };
         let speed = Vec3::new(self.vel.x, 0.0, self.vel.z).length();
         let moving = self.on_ground && speed > 0.3 && self.vault.is_none();
-        // One bob cycle per two steps (about 1.5 m of stride).
+        // One bob cycle per two steps (about 1.5 m of stride). Gentle, and
+        // eased in and out so starting and stopping don't jolt.
+        self.prev_bob = self.bob;
         self.bob += speed * dt * std::f32::consts::TAU / 1.5;
-        let amp = if moving { 0.018 + 0.01 * (speed / RUN) } else { 0.0 };
-        self.bob_amp += (amp - self.bob_amp) * (dt * 6.0).min(1.0);
+        let amp = if moving { 0.012 + 0.008 * (speed / RUN) } else { 0.0 };
+        self.bob_amp += (amp - self.bob_amp) * (dt * 3.0).min(1.0);
         if landed && falling < -3.0 {
             self.dip_v = (falling * 0.06).max(-1.4);
         }
