@@ -12,19 +12,21 @@ pub fn params(cam: &Camera, aspect: f32, night: bool) -> FrameParams {
         sun_col: Vec3::new(1.9, 1.3, 0.85),
         sky_col: Vec3::new(0.16, 0.19, 0.26),
         gnd_col: Vec3::new(0.10, 0.09, 0.08),
-        fog_col: Vec3::new(0.46, 0.50, 0.56),
+        fog_col: Vec3::new(0.62, 0.64, 0.66),
         fog_density: 0.0009,
         fog_height_falloff: 0.04,
         fog_base: 0.0,
         emissive_gain: 0.25,
         canyon_depth: 16.0,
-        canyon_strength: 0.65,
         torch_col: Vec3::ZERO,
         torch_range: 0.0,
         exposure: 1.0,
         bloom: 0.6,
         bloom_threshold: 1.0,
         spill: 0.5,
+        sky_top: Vec3::new(0.18, 0.30, 0.55),
+        // Height darkening is baked per vertex from the real surroundings now.
+        canyon_strength: 0.0,
     };
     if !night {
         return base;
@@ -39,7 +41,7 @@ pub fn params(cam: &Camera, aspect: f32, night: bool) -> FrameParams {
         emissive_gain: 1.3,
         spill: 1.0,
         exposure: 1.2,
-        canyon_strength: 0.8,
+        sky_top: Vec3::new(0.006, 0.01, 0.03),
         ..base
     }
 }

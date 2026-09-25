@@ -127,8 +127,6 @@ fn walk_params(cam: &Camera, aspect: f32, night: bool, torch: bool) -> FramePara
     let mut p = lighting::params(cam, aspect, night);
     // Up close the lanes are darker and the air thicker.
     p.fog_density *= 2.5;
-    p.canyon_depth = 30.0;
-    p.canyon_strength = 0.8;
     if torch {
         p.torch_col = Vec3::new(0.45, 0.42, 0.36);
         p.torch_range = 7.0;
@@ -667,14 +665,11 @@ fn hud(ui: &mut egui::Ui, w: &Walk, s: &Settings, g: Option<&game::Game>, info: 
         painter.galley(Pos2::new(pos.x - ss.x / 2.0, y), sub, paper);
     }
 
-    // Where you are.
-    painter.text(
-        Pos2::new(screen.center().x, screen.top() + 22.0),
-        Align2::CENTER_CENTER,
-        &info.place,
-        FontId::proportional(20.0),
-        Color32::from_rgba_unmultiplied(236, 228, 208, 230),
-    );
+    // Where you are, on a dark band so it reads against a bright sky.
+    let at = Pos2::new(screen.center().x, screen.top() + 22.0);
+    let r = painter.text(at, Align2::CENTER_CENTER, &info.place, FontId::proportional(20.0), Color32::TRANSPARENT);
+    painter.rect_filled(r.expand2(egui::vec2(14.0, 5.0)), 6.0, Color32::from_black_alpha(150));
+    painter.text(at, Align2::CENTER_CENTER, &info.place, FontId::proportional(20.0), Color32::from_rgba_unmultiplied(236, 228, 208, 235));
     // Crosshair.
     painter.circle_filled(screen.center(), 2.0, Color32::from_white_alpha(140));
 
@@ -1058,16 +1053,21 @@ mod tests {
     /// Checks a sample of whole buildings, inside and out.
     #[test]
     fn no_visible_z_fighting() {
+        // 1987: a few tall buildings' stair cores. 1950: the squatter huts.
+        let hits = z_fight_hits(END_YEAR, &|p: &kwc_sim::Plot| p.final_height() >= 8) + z_fight_hits(START_YEAR, &|p: &kwc_sim::Plot| p.height_at(START_YEAR) == 0);
+        assert!(hits == 0, "{hits} visible z-fighting overlaps");
+    }
+
+    fn z_fight_hits(year: u16, pick: &dyn Fn(&kwc_sim::Plot) -> bool) -> usize {
         use std::collections::HashMap;
         let city = generate(&Params::default());
-        let (walk, mut mesh) = world::build(&city, END_YEAR);
+        let (walk, mut mesh) = world::build(&city, year);
         // Inside and outside meet at walls: check both meshes together.
-        mesh.append(&citymesh::build(&city, END_YEAR, citymesh::ColourMode::Grime));
-        // Areas to check: a few tall buildings' stair cores.
+        mesh.append(&citymesh::build(&city, year, citymesh::ColourMode::Grime));
         let areas: Vec<(Vec3, Vec3)> = city
             .plots
             .iter()
-            .filter(|p| p.final_height() >= 8)
+            .filter(|p| pick(p))
             .take(6)
             .map(|p| {
                 let xs = p.cells.iter().map(|c| c.0 as f32 * CELL_M);
@@ -1124,7 +1124,7 @@ mod tests {
         for h in hits.iter().take(12) {
             eprintln!("coplanar overlap: axis {} +{} at {:.3} m, {:.3} m2, colours {:?} / {:?}", h.0 .0, h.0 .1, h.0 .2 as f32 / 1000.0, h.1, h.2, h.3);
         }
-        assert!(hits.is_empty(), "{} visible z-fighting overlaps", hits.len());
+        hits.len()
     }
 
     /// Knowing an era needs both: enough lanes walked, and deliveries by memory.

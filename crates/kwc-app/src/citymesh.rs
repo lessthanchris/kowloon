@@ -148,12 +148,63 @@ fn openings(city: &City, year: u16) -> std::collections::HashSet<(Cell, Dir, i32
     o
 }
 
+/// How much sky a point sees, 0..1, from the heights around it: open ground
+/// in 1950 is bright, a lane at the foot of 1987's canyons is dim. Looks out
+/// 15 m in eight directions (or only the half in front of a wall facing `n`).
+pub struct Sky {
+    w: i32,
+    d: i32,
+    h: Vec<f32>,
+}
+
+impl Sky {
+    pub fn new(city: &City, year: u16, over: &std::collections::HashMap<Cell, (f32, f32)>) -> Sky {
+        let mut h = vec![0.0; city.w * city.d];
+        for j in 0..city.d as u16 {
+            for i in 0..city.w as u16 {
+                let c = (i, j);
+                h[city.idx(c)] = col_height(city, c, year).max(over.get(&c).map_or(0.0, |o| o.1));
+            }
+        }
+        Sky { w: city.w as i32, d: city.d as i32, h }
+    }
+
+    pub fn open(&self, p: Vec3, n: Option<Vec3>) -> f32 {
+        let (mut sum, mut count) = (0.0f32, 0.0f32);
+        for k in 0..8 {
+            let a = k as f32 * std::f32::consts::FRAC_PI_4;
+            let (dx, dz) = (a.cos(), a.sin());
+            if n.is_some_and(|n| n.x * dx + n.z * dz < -0.1) {
+                continue;
+            }
+            let mut best = 0.0f32;
+            for step in 1..=10 {
+                let r = step as f32 * CELL_M;
+                let (i, j) = (((p.x + dx * r) / CELL_M).floor() as i32, ((p.z + dz * r) / CELL_M).floor() as i32);
+                if i < 0 || j < 0 || i >= self.w || j >= self.d {
+                    break;
+                }
+                best = best.max((self.h[(j * self.w + i) as usize] - p.y) / r);
+            }
+            sum += best / (1.0 + best * best).sqrt();
+            count += 1.0;
+        }
+        1.0 - sum / count.max(1.0)
+    }
+
+    /// As a vertex occlusion factor.
+    pub fn ao(&self, p: Vec3, n: Option<Vec3>) -> f32 {
+        0.18 + 0.82 * self.open(p, n)
+    }
+}
+
 pub fn build(city: &City, year: u16, mode: ColourMode) -> MeshData {
     let mut m = MeshData::default();
     let s = CELL_M;
     let holes = openings(city, year);
     let over: std::collections::HashMap<Cell, (f32, f32)> =
         crate::world::overbuild(city, year).into_iter().map(|(c, a, t)| (c, (a, t))).collect();
+    let sky = Sky::new(city, year, &over);
 
     // Surroundings: a dark plane under everything.
     let (w, d) = (city.w as f32 * s, city.d as f32 * s);
@@ -181,14 +232,19 @@ pub fn build(city: &City, year: u16, mode: ColourMode) -> MeshData {
             let h = col_height(city, c, year);
 
             if h <= 0.0 {
+                // Lanes are packed earth out in the open and wet, dark
+                // concrete where the buildings close in.
+                let open = sky.ao(Vec3::new(x0 + s / 2.0, 0.3, z0 + s / 2.0), None);
+                let lerp = |a: [f32; 3], b: [f32; 3], t: f32| [a[0] + (b[0] - a[0]) * t, a[1] + (b[1] - a[1]) * t, a[2] + (b[2] - a[2]) * t];
+                let t = ((open - 0.3) / 0.6).clamp(0.0, 1.0);
                 let col = match g {
                     Ground::Yamen => srgb(120, 112, 98), // stone-paved courtyard
-                    Ground::Alley => srgb(46, 46, 48),
+                    Ground::Alley => lerp(srgb(46, 46, 48), srgb(118, 104, 84), t),
                     Ground::Well => srgb(30, 32, 34),
-                    _ => srgb(58, 62, 44), // empty plot: scrub and huts' footprints
+                    _ => lerp(srgb(58, 62, 44), srgb(96, 94, 64), t), // empty plot: scrub and huts' footprints
                 };
                 let n = 0.9 + 0.2 * hash(i as u32, j as u32, 3);
-                m.ao = if over.contains_key(&c) { 0.35 } else { 1.0 };
+                m.ao = if over.contains_key(&c) { 0.35f32.min(open) } else { open };
                 m.quad([Vec3::new(x0, 0.0, z0), Vec3::new(x0, 0.0, z1), Vec3::new(x1, 0.0, z1), Vec3::new(x1, 0.0, z0)], mul(col, n), 0.0);
                 m.ao = 1.0;
                 if let Some(&(y0, y1)) = over.get(&c) {
@@ -244,6 +300,9 @@ pub fn build(city: &City, year: u16, mode: ColourMode) -> MeshData {
                         continue;
                     }
                     let stain = 0.82 + 0.3 * hash(i as u32 ^ (f as u32) << 16, j as u32, dir as u32);
+                    let (dx, dz) = dir.delta();
+                    let nrm = Vec3::new(dx as f32, 0.0, dz as f32);
+                    m.ao = sky.ao(Vec3::new(x0 + s / 2.0, (y0 + y1) / 2.0, z0 + s / 2.0) + nrm * (s / 2.0 + 0.2), Some(nrm));
                     m.cuboid(Vec3::new(x0, y0, z0), Vec3::new(x1, y1, z1), mul(base, stain), 0.0, face);
 
                     // No windows at street level: that's shopfronts and doors.
@@ -254,13 +313,19 @@ pub fn build(city: &City, year: u16, mode: ColourMode) -> MeshData {
             }
         }
     }
+    let centre = |a: &crate::world::Aabb| (a.min + a.max) * 0.5;
     for fx in crate::lights::fixtures(city, year) {
+        m.ao = sky.ao(centre(&fx.aabb), None);
         m.cuboid(fx.aabb.min, fx.aabb.max, fx.col, fx.emit, Faces::ALL);
     }
-    let (pieces, _) = crate::world::roof_furniture(city, year);
+    let (mut pieces, _) = crate::world::roof_furniture(city, year);
+    pieces.extend(crate::world::squatters(city, year));
+    pieces.extend(crate::world::surroundings(city, year));
     for p in pieces {
-        m.cuboid(p.aabb.min, p.aabb.max, p.col, 0.0, p.faces);
+        m.ao = sky.ao(centre(&p.aabb), None);
+        m.cuboid(p.aabb.min, p.aabb.max, p.col, p.emit, p.faces);
     }
+    m.ao = 1.0;
     m
 }
 

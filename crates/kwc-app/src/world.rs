@@ -7,7 +7,7 @@ use crate::citymesh::{hash, srgb};
 use glam::Vec3;
 use kwc_engine::mesh::{Faces, MeshData};
 use kwc_sim::*;
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 
 pub const S: f32 = STOREY_M;
 const C: f32 = CELL_M;
@@ -362,6 +362,7 @@ pub fn build(city: &City, year: u16) -> (WalkWorld, MeshData) {
     // Roof furniture is drawn by the city mesher; here it only collides.
     let (pieces, ladders) = roof_furniture(city, year);
     b.boxes.extend(pieces.iter().filter(|p| p.solid).map(|p| p.aabb));
+    b.boxes.extend(squatters(city, year).iter().chain(&surroundings(city, year)).filter(|p| p.solid).map(|p| p.aabb));
     b.ladders.extend(ladders);
 
     // Spawn outside the South Gate, looking in along the lane behind it.
@@ -702,13 +703,15 @@ pub struct Piece {
     pub col: [f32; 3],
     pub faces: Faces,
     pub solid: bool,
+    /// Glow (lit hut windows, tenement windows); 0 for plain surfaces.
+    pub emit: f32,
 }
 
 pub fn roof_furniture(city: &City, year: u16) -> (Vec<Piece>, Vec<Ladder>) {
     let over: HashMap<Cell, (f32, f32)> = overbuild(city, year).into_iter().map(|(c, a, t)| (c, (a, t))).collect();
     let mut out: Vec<Piece> = vec![];
     let mut ladders = vec![];
-    let mut put = |aabb: Aabb, col: [f32; 3], solid: bool| out.push(Piece { aabb, col, faces: ALL, solid });
+    let mut put = |aabb: Aabb, col: [f32; 3], solid: bool| out.push(Piece { aabb, col, faces: ALL, solid, emit: 0.0 });
     let wood = srgb(150, 120, 80);
 
     // Stair huts over the wells.
@@ -871,4 +874,169 @@ pub fn roof_furniture(city: &City, year: u16) -> (Vec<Piece>, Vec<Ladder>) {
         }
     }
     (out, ladders)
+}
+
+/// Ground not yet built on: in the 1950s that's the squatter village. Tin and
+/// timber huts, vegetable patches, drums, woodpiles, washing. Each plot keeps
+/// its huts until the year it's built over. Nothing solid goes right up
+/// against a building that already stands (its doors must stay reachable).
+pub fn squatters(city: &City, year: u16) -> Vec<Piece> {
+    let mut out: Vec<Piece> = vec![];
+    let mut put = |aabb: Aabb, col: [f32; 3], faces: Faces, solid: bool, emit: f32| out.push(Piece { aabb, col, faces, solid, emit });
+    let built = |c: Cell| city.ground_at(c) == Ground::Plot && city.height_at(c, year) > 0;
+    let lane = |c: Cell| city.ground_at(c) != Ground::Plot;
+    let nb = Faces { bottom: false, ..ALL };
+    for plot in city.plots.iter().filter(|p| p.height_at(year) == 0) {
+        let mine: HashSet<Cell> = plot.cells.iter().copied().collect();
+        // Room for something solid: in this plot, not touching a standing building.
+        let ok = |c: Cell| mine.contains(&c) && !Dir::ALL.iter().any(|&d| city.step(c, d).is_some_and(built));
+        let mut used: HashSet<Cell> = HashSet::new();
+        let mut cells = plot.cells.clone();
+        cells.sort();
+        for c in cells {
+            if used.contains(&c) {
+                continue;
+            }
+            let r = hash(c.0 as u32 * 17, c.1 as u32 * 29, 601);
+            let free = |b: &Cell| ok(*b) && !used.contains(b);
+            let (e, s, se) = ((c.0 + 1, c.1), (c.0, c.1 + 1), (c.0 + 1, c.1 + 1));
+            let hut = if r < 0.55 && [c, e, s, se].iter().all(free) {
+                Some((c, se))
+            } else if r < 0.75 && [c, e].iter().all(free) {
+                Some((c, e))
+            } else if r < 0.75 && [c, s].iter().all(free) {
+                Some((c, s))
+            } else {
+                None
+            };
+            if let Some((a, b)) = hut {
+                let cells: Vec<Cell> = (a.0..=b.0).flat_map(|i| (a.1..=b.1).map(move |j| (i, j))).collect();
+                used.extend(cells.iter().copied());
+                let (x0, z0) = (a.0 as f32 * C + 0.12, a.1 as f32 * C + 0.12);
+                let (x1, z1) = ((b.0 + 1) as f32 * C - 0.12, (b.1 + 1) as f32 * C - 0.12);
+                let k = hash(a.0 as u32, a.1 as u32, 602);
+                let h = 2.1 + 0.5 * hash(a.0 as u32, a.1 as u32, 603);
+                const WALLS: [[u8; 3]; 5] = [[120, 118, 105], [110, 88, 64], [72, 70, 68], [95, 115, 130], [132, 122, 96]];
+                const ROOFS: [[u8; 3]; 3] = [[128, 94, 68], [140, 140, 135], [46, 46, 50]];
+                let wc = WALLS[(k * 5.0) as usize % 5];
+                let rc = ROOFS[(hash(a.0 as u32, a.1 as u32, 604) * 3.0) as usize % 3];
+                put(Aabb::new(Vec3::new(x0, 0.0, z0), Vec3::new(x1, h, z1)), srgb(wc[0], wc[1], wc[2]), Faces { top: false, bottom: false, ..ALL }, true, 0.0);
+                // A tin roof, overhanging a little.
+                put(Aabb::new(Vec3::new(x0 - 0.08, h, z0 - 0.08), Vec3::new(x1 + 0.08, h + 0.07, z1 + 0.08)), srgb(rc[0], rc[1], rc[2]), ALL, true, 0.0);
+                // The door and a window face the lane if there is one.
+                let d = Dir::ALL
+                    .into_iter()
+                    .find(|&d| cells.iter().any(|&c| city.step(c, d).is_some_and(lane)))
+                    .unwrap_or(if k < 0.5 { Dir::S } else { Dir::E });
+                let (dx, dz) = d.delta();
+                let (fx, fz) = (dx as f32, dz as f32);
+                let (mx, mz) = ((x0 + x1) / 2.0, (z0 + z1) / 2.0);
+                let (hx, hz) = ((x1 - x0) / 2.0, (z1 - z0) / 2.0);
+                // A panel on that face, `along` it from the middle, 3 cm proud.
+                let panel = |along: f32, w: f32, y0: f32, y1: f32| {
+                    let (ax, az) = (fz.abs(), fx.abs());
+                    let (px, pz) = (mx + fx * (hx + 0.015) + ax * along, mz + fz * (hz + 0.015) + az * along);
+                    let (ex, ez) = (ax * w / 2.0 + fx.abs() * 0.015, az * w / 2.0 + fz.abs() * 0.015);
+                    Aabb::new(Vec3::new(px - ex, y0, pz - ez), Vec3::new(px + ex, y1, pz + ez))
+                };
+                let span = if fx != 0.0 { hz } else { hx };
+                put(panel(-span * 0.35, 0.75, 0.0, 1.85), srgb(58, 44, 34), nb, false, 0.0);
+                if span > 1.0 {
+                    let lit = hash(a.0 as u32, a.1 as u32, 605) < 0.6;
+                    let (col, emit) = if lit { (srgb(255, 180, 100), 1.2) } else { (srgb(30, 34, 38), 0.0) };
+                    put(panel(span * 0.45, 0.5, 1.1, 1.5), col, ALL, false, emit);
+                }
+                continue;
+            }
+            // Smaller things on the ground between the huts.
+            let (x0, z0, _, _) = cell_rect(c);
+            let (cx, cz) = (x0 + C / 2.0, z0 + C / 2.0);
+            let at = |dx: f32, dz: f32, w: f32, dd: f32, y0: f32, y1: f32| Aabb::new(Vec3::new(cx + dx - w / 2.0, y0, cz + dz - dd / 2.0), Vec3::new(cx + dx + w / 2.0, y1, cz + dz + dd / 2.0));
+            let r2 = hash(c.0 as u32 * 7, c.1 as u32 * 3, 611);
+            let solid_ok = ok(c);
+            if r2 < 0.16 {
+                // Vegetable patch: dark soil, rows of greens.
+                put(at(0.0, 0.0, 1.2, 1.2, 0.0, 0.08), srgb(70, 52, 36), nb, false, 0.0);
+                for k in 0..3u32 {
+                    let dz = -0.4 + k as f32 * 0.4;
+                    let hh = 0.2 + 0.2 * hash(c.0 as u32, c.1 as u32, 612 + k);
+                    put(at(0.0, dz, 1.0, 0.18, 0.08, 0.08 + hh), srgb(70, 120 + (k * 12) as u8, 55), nb, false, 0.0);
+                }
+            } else if r2 < 0.24 && solid_ok {
+                // Oil drums.
+                put(at(-0.3, 0.1, 0.55, 0.55, 0.0, 0.88), srgb(140, 60, 40), nb, true, 0.0);
+                put(at(0.35, -0.2, 0.55, 0.55, 0.0, 0.88), srgb(60, 80, 110), nb, true, 0.0);
+            } else if r2 < 0.31 && solid_ok {
+                // Woodpile under a scrap of tin.
+                put(at(0.0, 0.0, 1.2, 0.6, 0.0, 0.7), srgb(125, 96, 64), nb, true, 0.0);
+                put(at(0.0, 0.0, 1.3, 0.7, 0.7, 0.74), srgb(128, 94, 68), ALL, true, 0.0);
+            } else if r2 < 0.40 {
+                // Washing on bamboo poles.
+                let pole = srgb(170, 150, 90);
+                put(at(-0.65, 0.0, 0.05, 0.05, 0.0, 2.0), pole, nb, false, 0.0);
+                put(at(0.65, 0.0, 0.05, 0.05, 0.0, 2.0), pole, nb, false, 0.0);
+                put(at(0.0, 0.0, 1.25, 0.03, 1.97, 2.0), pole, ALL, false, 0.0);
+                let cols = [srgb(200, 60, 60), srgb(230, 230, 220), srgb(70, 110, 180), srgb(220, 190, 80)];
+                for k in 0..3u32 {
+                    let col = cols[(hash(c.0 as u32, c.1 as u32, 620 + k) * 4.0) as usize % 4];
+                    put(at(-0.4 + k as f32 * 0.4, 0.0, 0.3, 0.02, 1.3 + 0.2 * hash(k, c.0 as u32, 7), 1.96), col, ALL, false, 0.0);
+                }
+            } else if r2 < 0.46 && solid_ok {
+                // Glazed water jars.
+                put(at(-0.25, 0.2, 0.5, 0.5, 0.0, 0.6), srgb(90, 60, 40), nb, true, 0.0);
+                put(at(0.3, -0.2, 0.4, 0.4, 0.0, 0.5), srgb(70, 50, 36), nb, true, 0.0);
+            } else if r2 < 0.50 {
+                // A low stool and a crate.
+                put(at(-0.3, 0.0, 0.35, 0.35, 0.0, 0.4), srgb(150, 110, 70), nb, false, 0.0);
+                put(at(0.3, 0.1, 0.5, 0.4, 0.0, 0.35), srgb(120, 100, 70), nb, false, 0.0);
+            }
+        }
+    }
+    out
+}
+
+/// Kowloon City around the walls: blocks of tenements across a ring road,
+/// low in the 1950s and rising (under the same flight path) by the 1980s.
+pub fn surroundings(city: &City, year: u16) -> Vec<Piece> {
+    let mut out = vec![];
+    let (w, d) = (city.w as f32 * C, city.d as f32 * C);
+    let t = ((year as f32 - 1950.0) / 37.0).clamp(0.0, 1.0);
+    const STEP: f32 = 24.0;
+    const ROAD: f32 = 16.0;
+    let n = 7;
+    for bj in -n..(d / STEP) as i32 + n {
+        for bi in -n..(w / STEP) as i32 + n {
+            let (x0, z0) = (bi as f32 * STEP + 4.0, bj as f32 * STEP + 4.0);
+            let (x1, z1) = (x0 + STEP - 8.0, z0 + STEP - 8.0);
+            if x1 > -ROAD && x0 < w + ROAD && z1 > -ROAD && z0 < d + ROAD {
+                continue;
+            }
+            let (hi, hj) = ((bi + 100) as u32, (bj + 100) as u32);
+            if hash(hi, hj, 701) < 0.12 {
+                continue; // an open lot
+            }
+            // Two or three buildings to a block, each its own height.
+            let parts = 2 + (hash(hi, hj, 702) * 2.0) as u32;
+            let pw = (x1 - x0) / parts as f32;
+            for k in 0..parts {
+                let (ax, bx) = (x0 + k as f32 * pw, x0 + (k + 1) as f32 * pw - 0.4);
+                let r = hash(hi * 3 + k, hj, 703);
+                let storeys = (2.0 + r * 2.0 + t * (3.0 + hash(hi, hj * 5 + k, 704) * 7.0)).round().min(14.0);
+                let top = storeys * S;
+                const P: [[u8; 3]; 5] = [[150, 144, 130], [128, 130, 124], [160, 150, 132], [120, 128, 136], [140, 128, 120]];
+                let pc = P[(hash(hi, hj, 705 + k) * 5.0) as usize % 5];
+                out.push(Piece { aabb: Aabb::new(Vec3::new(ax, 0.0, z0), Vec3::new(bx, top, z1)), col: srgb(pc[0], pc[1], pc[2]), faces: Faces { bottom: false, ..ALL }, solid: true, emit: 0.0 });
+                // A band of windows per storey front and back: lit ones glow at night.
+                for f in 1..storeys as u32 {
+                    let y = f as f32 * S + 0.9;
+                    for (side, za, zb) in [(0u32, z0 - 0.04, z0), (1, z1, z1 + 0.04)] {
+                        let lit = hash(hi * 7 + k, hj * 13 + side, 710 + f) < 0.3;
+                        let (col, emit) = if lit { (srgb(255, 200, 130), 1.0) } else { (srgb(40, 46, 52), 0.0) };
+                        out.push(Piece { aabb: Aabb::new(Vec3::new(ax + 0.8, y, za), Vec3::new(bx - 0.8, y + 1.1, zb)), col, faces: ALL, solid: false, emit });
+                    }
+                }
+            }
+        }
+    }
+    out
 }

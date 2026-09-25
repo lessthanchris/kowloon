@@ -31,6 +31,8 @@ pub struct FrameParams {
     pub bloom_threshold: f32,
     /// Strength of the baked lamp spill.
     pub spill: f32,
+    /// Sky colour overhead (the horizon is the fog colour).
+    pub sky_top: Vec3,
 }
 
 #[repr(C)]
@@ -46,6 +48,8 @@ struct Uniforms {
     fog: [f32; 4],
     misc: [f32; 4],
     torch: [f32; 4],
+    inv_view_proj: [[f32; 4]; 4],
+    sky_top: [f32; 4],
 }
 
 fn v4(v: Vec3, w: f32) -> [f32; 4] {
@@ -80,6 +84,7 @@ impl TextMesh {
 }
 
 pub struct Renderer {
+    sky_pipeline: wgpu::RenderPipeline,
     text_pipeline: wgpu::RenderPipeline,
     text_bgl: wgpu::BindGroupLayout,
     text_bind: Option<wgpu::BindGroup>,
@@ -180,6 +185,30 @@ impl Renderer {
             multiview_mask: None,
             cache: None,
         });
+        // Sky: a full-screen gradient drawn first, behind everything.
+        let sky_pipeline = device.create_render_pipeline(&wgpu::RenderPipelineDescriptor {
+            label: Some("sky"),
+            layout: Some(&layout),
+            vertex: wgpu::VertexState { module: &module, entry_point: Some("vs_sky"), buffers: &[], compilation_options: Default::default() },
+            primitive: wgpu::PrimitiveState::default(),
+            depth_stencil: Some(wgpu::DepthStencilState {
+                format: DEPTH,
+                depth_write_enabled: Some(false),
+                depth_compare: Some(wgpu::CompareFunction::Always),
+                stencil: Default::default(),
+                bias: Default::default(),
+            }),
+            multisample: wgpu::MultisampleState { count: MSAA, mask: !0, alpha_to_coverage_enabled: false },
+            fragment: Some(wgpu::FragmentState {
+                module: &module,
+                entry_point: Some("fs_sky"),
+                targets: &[Some(wgpu::ColorTargetState { format: HDR, blend: None, write_mask: wgpu::ColorWrites::ALL })],
+                compilation_options: Default::default(),
+            }),
+            multiview_mask: None,
+            cache: None,
+        });
+
         // Text: world-space glyph quads, depth-tested (not written), alpha-blended.
         let text_module = device.create_shader_module(wgpu::ShaderModuleDescriptor {
             label: Some("text shader"),
@@ -242,7 +271,7 @@ impl Renderer {
         let (w, h) = (gpu.config.width, gpu.config.height);
         let (color_msaa, depth) = targets(device, w, h);
         let post = Post::new(device, format, w, h);
-        Renderer { text_pipeline, text_bgl, text_bind: None, pipeline, ubuf, bind, color_msaa, depth, size: (w, h), format, post }
+        Renderer { sky_pipeline, text_pipeline, text_bgl, text_bind: None, pipeline, ubuf, bind, color_msaa, depth, size: (w, h), format, post }
     }
 
     /// The font atlas the text meshes' UVs point into (RGBA8, coverage in alpha).
@@ -308,6 +337,8 @@ impl Renderer {
             fog: [p.fog_density, p.fog_height_falloff, p.fog_base, p.emissive_gain],
             misc: [p.canyon_depth, p.canyon_strength, p.spill, 0.0],
             torch: v4(p.torch_col, p.torch_range),
+            inv_view_proj: p.view_proj.inverse().to_cols_array_2d(),
+            sky_top: v4(p.sky_top, 0.0),
         };
         gpu.queue.write_buffer(&self.ubuf, 0, bytemuck::bytes_of(&u));
         let fc = p.fog_col;
@@ -331,6 +362,9 @@ impl Renderer {
             occlusion_query_set: None,
             multiview_mask: None,
         });
+        pass.set_pipeline(&self.sky_pipeline);
+        pass.set_bind_group(0, &self.bind, &[]);
+        pass.draw(0..3, 0..1);
         pass.set_pipeline(&self.pipeline);
         pass.set_bind_group(0, &self.bind, &[]);
         for m in meshes {

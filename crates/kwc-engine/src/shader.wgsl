@@ -13,7 +13,43 @@ struct Uniforms {
     fog: vec4<f32>,       // x density, y height falloff, z fog base height, w emissive gain
     misc: vec4<f32>,      // x canyon depth (m) for ground darkening, y darkening strength, z light-spill gain
     torch: vec4<f32>,     // rgb colour * intensity, w range (m); 0 = off
+    inv_view_proj: mat4x4<f32>,
+    sky_top: vec4<f32>,   // zenith colour (the horizon is fog_col)
 };
+
+/// The sky along a view direction: haze at the horizon, colour overhead, a
+/// glow around the sun. Fog fades towards this, so distance melts into sky.
+fn sky(dir: vec3<f32>, disc: f32) -> vec3<f32> {
+    let up = clamp(dir.y, 0.0, 1.0);
+    var c = mix(u.fog_col.rgb, u.sky_top.rgb, pow(up, 0.55));
+    if (dir.y < 0.0) {
+        c = u.fog_col.rgb * (1.0 + dir.y * 0.4);
+    }
+    let s = max(dot(dir, normalize(u.sun_dir.xyz)), 0.0);
+    c += u.sun_col.rgb * (pow(s, 400.0) * 3.0 * disc + pow(s, 12.0) * 0.12);
+    return c;
+}
+
+struct SkyOut {
+    @builtin(position) pos: vec4<f32>,
+    @location(0) ndc: vec2<f32>,
+};
+
+@vertex
+fn vs_sky(@builtin(vertex_index) i: u32) -> SkyOut {
+    let xy = vec2<f32>(f32((i << 1u) & 2u), f32(i & 2u)) * 2.0 - 1.0;
+    var o: SkyOut;
+    o.pos = vec4<f32>(xy, 1.0, 1.0);
+    o.ndc = xy;
+    return o;
+}
+
+@fragment
+fn fs_sky(i: SkyOut) -> @location(0) vec4<f32> {
+    let far = u.inv_view_proj * vec4<f32>(i.ndc, 1.0, 1.0);
+    let dir = normalize(far.xyz / far.w - u.cam_pos.xyz);
+    return vec4<f32>(sky(dir, 1.0), 1.0);
+}
 
 @group(0) @binding(0) var<uniform> u: Uniforms;
 
@@ -78,6 +114,6 @@ fn fs_main(i: VOut) -> @location(0) vec4<f32> {
     let f = 1.0 - exp(-d * u.fog.x * (0.35 + 0.65 * h));
     // Lights punch through fog a little better than walls do.
     let glow = clamp(abs(i.emit), 0.0, 1.0);
-    c = mix(c, u.fog_col.rgb, f * (1.0 - 0.45 * glow));
+    c = mix(c, sky(normalize(i.world - u.cam_pos.xyz), 0.0), f * (1.0 - 0.45 * glow));
     return vec4<f32>(c, 1.0);
 }
