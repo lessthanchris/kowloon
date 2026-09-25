@@ -1,0 +1,18 @@
+[package]
+name = "kwc-app"
+edition.workspace = true
+version.workspace = true
+
+[[bin]]
+name = "kowloon"
+path = "src/main.rs"
+
+[dependencies]
+kwc-sim = { path = "../kwc-sim" }
+kwc-engine = { path = "../kwc-engine" }
+glam = { version = "0.30", features = ["bytemuck"] }
+egui = "0.36.2"
+winit = "0.30.13"
+env_logger = "0.11"
+log = "0.4"
+image = { version = "0.25", default-features = false, features = ["png"] }
