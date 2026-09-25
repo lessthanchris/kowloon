@@ -137,6 +137,8 @@ pub struct Game {
     pub met: Vec<Met>,
     /// This era is understood (shown once).
     pub understood: bool,
+    /// Where to put you when this era's walk is next built (from a save).
+    pub resume: Option<[f32; 4]>,
 }
 
 #[derive(serde::Serialize, serde::Deserialize)]
@@ -148,6 +150,9 @@ pub struct Save {
     pub clean: u32,
     pub seen: Vec<Cell>,
     pub met: Vec<Met>,
+    /// Where you were standing (x, y, z, yaw), to carry on from there.
+    #[serde(default)]
+    pub pos: Option<[f32; 4]>,
 }
 
 fn item_for(trade: UnitUse, rng: &mut impl Rng) -> &'static str {
@@ -197,13 +202,14 @@ impl Game {
             job_helped: false,
             met: vec![],
             understood: false,
+            resume: None,
         }
     }
 
     pub fn save(&self) -> Save {
         let mut seen: Vec<Cell> = self.seen.iter().copied().collect();
         seen.sort_unstable();
-        Save { seed: self.seed, year: self.year, delivered: self.delivered, tips: self.tips, clean: self.clean, seen, met: self.met.clone() }
+        Save { seed: self.seed, year: self.year, delivered: self.delivered, tips: self.tips, clean: self.clean, seen, met: self.met.clone(), pos: None }
     }
 
     pub fn load(s: Save) -> Game {
@@ -213,6 +219,7 @@ impl Game {
         g.clean = s.clean;
         g.seen = s.seen.into_iter().collect();
         g.met = s.met;
+        g.resume = s.pos;
         g
     }
 
@@ -253,6 +260,7 @@ impl Game {
         self.job = None;
         self.job_helped = false;
         self.understood = false;
+        self.resume = None;
         self.rng = ChaCha8Rng::seed_from_u64(self.seed ^ 0xDE11 ^ year as u64);
         self.toast(format!("{year}. The city has grown; your notebook is out of date."));
     }

@@ -150,6 +150,9 @@ struct App {
     settings: Settings,
     orbit: OrbitCamera,
     walk: Option<Walk>,
+    /// The walk you left with Tab: picked up again, where you stood, if the
+    /// year hasn't changed.
+    parked: Option<Walk>,
     /// The delivery game (None = free roaming).
     game: Option<game::Game>,
     signs: signtext::SignText,
@@ -290,7 +293,12 @@ impl App {
 
     fn save_game(&self) {
         if let Some(g) = &self.game {
-            if let Ok(json) = serde_json::to_string(&g.save()) {
+            let mut save = g.save();
+            save.pos = self.walk.as_ref().or(self.parked.as_ref()).filter(|w| w.year == g.year).map(|w| {
+                let p = w.player.pos;
+                [p.x, p.y, p.z, w.player.yaw]
+            });
+            if let Ok(json) = serde_json::to_string(&save) {
                 let _ = std::fs::write(SAVE_FILE, json);
             }
         }
@@ -344,14 +352,26 @@ impl App {
         let run = self.run.as_mut().unwrap();
         let year = self.game.as_ref().map_or(self.settings.year.floor() as u16, |g| g.year);
         self.settings.playing = false;
-        self.walk = Some(Walk::new(&run.gpu, &mut run.renderer, &self.signs, &self.world.city, &self.world.society, year));
+        self.walk = match self.parked.take() {
+            // Back from the overview: carry on exactly where you were.
+            Some(w) if w.year == year => Some(w),
+            _ => {
+                let mut w = Walk::new(&run.gpu, &mut run.renderer, &self.signs, &self.world.city, &self.world.society, year);
+                // Or where you were when you last saved.
+                if let Some(p) = self.game.as_mut().and_then(|g| g.resume.take()) {
+                    w.player.pos = Vec3::new(p[0], p[1], p[2]);
+                    w.player.yaw = p[3];
+                }
+                Some(w)
+            }
+        };
         let w = &run.window;
         let _ = w.set_cursor_grab(CursorGrabMode::Locked).or_else(|_| w.set_cursor_grab(CursorGrabMode::Confined));
         w.set_cursor_visible(false);
     }
 
     fn leave_walk(&mut self) {
-        self.walk = None;
+        self.parked = self.walk.take();
         self.keys.clear();
         if let Some(run) = &self.run {
             let _ = run.window.set_cursor_grab(CursorGrabMode::None);
@@ -441,6 +461,7 @@ impl App {
         }
         if self.world.city.params.seed != s.seed {
             self.world = World::new(s.seed);
+            self.parked = None;
         }
         let year = self.walk.as_ref().map_or(s.year.floor() as u16, |w| w.year);
         let run = self.run.as_mut().unwrap();
@@ -939,6 +960,7 @@ fn main() {
         },
         orbit,
         walk: None,
+        parked: None,
         game,
         signs: signtext::SignText::new(),
         pending_era: None,
