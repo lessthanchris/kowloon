@@ -108,6 +108,16 @@ impl Gpu {
         }
     }
 
+    /// Vsync on: frames wait for the display. Off: as fast as the GPU goes.
+    pub fn set_vsync(&mut self, on: bool) {
+        self.config.present_mode = if on { wgpu::PresentMode::AutoVsync } else { wgpu::PresentMode::AutoNoVsync };
+        self.reconfigure();
+    }
+
+    pub fn vsync(&self) -> bool {
+        self.config.present_mode == wgpu::PresentMode::AutoVsync
+    }
+
     pub fn reconfigure(&self) {
         if let Some(s) = &self.surface {
             s.configure(&self.device, &self.config);

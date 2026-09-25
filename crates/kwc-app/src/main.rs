@@ -5,6 +5,7 @@
 //!   kowloon --shot out.png --walk [--lane N] [--at x,y,z,yaw,pitch] [--torch]
 //!                                 render one frame headless and save it
 
+mod autopilot;
 mod citymesh;
 mod game;
 mod lighting;
@@ -49,10 +50,14 @@ struct Settings {
     map_open: bool,
     ledger_open: bool,
     ledger_pick: Option<usize>,
+    /// What the autopilot is up to, while it's driving.
+    demo_status: Option<String>,
+    /// Frames wait for the display (V toggles).
+    vsync: bool,
 }
 
 struct World {
-    city: City,
+    city: Arc<City>,
     society: society::Society,
     mesh: Option<GpuMesh>,
     built_for: Option<(u16, ColourMode, u64)>,
@@ -62,7 +67,7 @@ impl World {
     fn new(seed: u64) -> World {
         let city = generate(&Params { seed, ..Default::default() });
         let society = society::generate(&city);
-        World { city, society, mesh: None, built_for: None }
+        World { city: Arc::new(city), society, mesh: None, built_for: None }
     }
     fn ensure_mesh(&mut self, gpu: &Gpu, year: u16, mode: ColourMode) {
         let key = (year, mode, self.city.params.seed);
@@ -81,7 +86,7 @@ impl World {
 
 /// Everything needed to walk around one year's city.
 struct Walk {
-    world: world::WalkWorld,
+    world: Arc<world::WalkWorld>,
     interior: Vec<GpuMesh>,
     player: player::Player,
     year: u16,
@@ -111,7 +116,7 @@ impl Walk {
         renderer.set_text_atlas(gpu, aw, ah, &atlas);
         Walk {
             interior: GpuMesh::upload_chunked(&gpu.device, &mesh),
-            world,
+            world: Arc::new(world),
             player,
             year,
             spots: game::spots(city, soc, year),
@@ -161,6 +166,10 @@ struct App {
     signs: signtext::SignText,
     /// Moving on: the timelapse runs to this year, then you're back on foot.
     pending_era: Option<u16>,
+    /// Demo mode (P): the courier does the rounds by itself.
+    autopilot: Option<autopilot::Autopilot>,
+    /// Where the game saves (a trial of another era keeps its own).
+    save_file: String,
     started: Instant,
     plane: Option<GpuMesh>,
     /// Everyone near you, posed for this frame.
@@ -189,7 +198,7 @@ impl ApplicationHandler for App {
     }
 
     fn device_event(&mut self, _el: &ActiveEventLoop, _id: DeviceId, event: DeviceEvent) {
-        if self.settings.map_open || self.settings.ledger_open {
+        if self.settings.map_open || self.settings.ledger_open || self.autopilot.is_some() {
             return;
         }
         if let (DeviceEvent::MouseMotion { delta }, Some(w)) = (event, self.walk.as_mut()) {
@@ -226,9 +235,25 @@ impl ApplicationHandler for App {
                             KeyCode::Escape if walking => self.leave_walk(),
                             KeyCode::KeyT => self.settings.torch = !self.settings.torch,
                             KeyCode::KeyN => self.settings.night = !self.settings.night,
+                            KeyCode::KeyV => {
+                                if let Some(run) = self.run.as_mut() {
+                                    let on = !run.gpu.vsync();
+                                    run.gpu.set_vsync(on);
+                                    self.settings.vsync = on;
+                                }
+                            }
                             KeyCode::KeyE if walking => self.interact(),
                             KeyCode::KeyH => self.settings.help = !self.settings.help,
                             KeyCode::KeyG => self.settings.memory = !self.settings.memory,
+                            KeyCode::KeyP if walking && self.game.is_some() => {
+                                self.autopilot = match self.autopilot.take() {
+                                    Some(_) => None,
+                                    None => {
+                                        self.settings.help = false;
+                                        Some(autopilot::Autopilot::default())
+                                    }
+                                };
+                            }
                             KeyCode::KeyM if walking => {
                                 self.settings.map_open = !self.settings.map_open;
                                 self.settings.ledger_open = false;
@@ -239,7 +264,11 @@ impl ApplicationHandler for App {
                                 self.settings.map_open = false;
                                 self.sync_cursor();
                             }
-                            KeyCode::KeyY if walking => self.move_on(),
+                            // Shift+Y: skip ahead without knowing this era (for trying later years).
+                            KeyCode::KeyY if walking => {
+                                let skip = self.keys.contains(&KeyCode::ShiftLeft) || self.keys.contains(&KeyCode::ShiftRight);
+                                self.move_on(skip)
+                            }
                             _ => {}
                         }
                     }
@@ -309,7 +338,7 @@ impl App {
                 [p.x, p.y, p.z, w.player.yaw]
             });
             if let Ok(json) = serde_json::to_string(&save) {
-                let _ = std::fs::write(SAVE_FILE, json);
+                let _ = std::fs::write(&self.save_file, json);
             }
         }
     }
@@ -327,7 +356,7 @@ impl App {
     }
 
     /// Y: once you know this era, watch the city grow to the next and carry on.
-    fn move_on(&mut self) {
+    fn move_on(&mut self, skip: bool) {
         let city = &self.world.city;
         let Some(g) = self.game.as_ref() else { return };
         let Some(next) = g.next_era() else {
@@ -336,9 +365,9 @@ impl App {
             }
             return;
         };
-        if !g.knows_era(city) {
+        if !skip && !g.knows_era(city) {
             let msg = format!(
-                "Not yet: walk more of the lanes ({:.0}%/{:.0}%) and make {} deliveries by memory ({} so far).",
+                "Not yet: walk more of the lanes ({:.0}%/{:.0}%) and make {} deliveries by memory ({} so far). Shift+Y skips ahead anyway.",
                 g.coverage(city) * 100.0,
                 game::KNOW_COVERAGE * 100.0,
                 game::KNOW_CLEAN,
@@ -414,10 +443,33 @@ impl App {
         if std::mem::take(&mut self.settings.want_walk) {
             self.enter_walk();
         }
-        let input = self.input();
+        let mut input = self.input();
+        // Demo mode drives until you touch the keys.
+        if self.autopilot.is_some() && (input.forward != 0.0 || input.strafe != 0.0) {
+            self.autopilot = None;
+            if let Some(g) = self.game.as_mut() {
+                g.toast("You take over.");
+            }
+        }
+        let mut act = autopilot::Act::Walk;
+        if let (Some(ap), Some(w), Some(g)) = (self.autopilot.as_mut(), self.walk.as_mut(), self.game.as_ref()) {
+            let target = autopilot::target(g, &w.spots);
+            (input, act) = ap.drive(&w.world, &self.world.city, w.year, &mut w.player, target, dt);
+        }
+        self.settings.demo_status = self.autopilot.as_ref().map(|a| a.status.clone());
         if let Some(w) = self.walk.as_mut() {
             w.player.update(&w.world, input, dt);
             w.crowd.update(dt, w.player.pos);
+        }
+        match act {
+            autopilot::Act::Knock => self.interact(),
+            autopilot::Act::Lost => {
+                if let Some(g) = self.game.as_mut() {
+                    g.job = None;
+                    g.toast("The courier couldn't find a way there, and passed the job on.");
+                }
+            }
+            autopilot::Act::Walk => {}
         }
         if let Some(g) = self.game.as_mut() {
             g.tick(dt);
@@ -425,9 +477,12 @@ impl App {
                 g.new_job(&self.world.city, &self.world.society);
             }
             if let Some(w) = &self.walk {
-                g.observe(&self.world.city, w.player.pos);
+                // The autopilot's walking doesn't count as you learning the lanes.
+                if self.autopilot.is_none() {
+                    g.observe(&self.world.city, w.player.pos);
+                }
                 // Any help during a job means it wasn't done from memory.
-                if g.job.is_some() && (!self.settings.memory || self.settings.map_open) {
+                if g.job.is_some() && (!self.settings.memory || self.settings.map_open || self.autopilot.is_some()) {
                     g.job_helped = true;
                 }
                 if !g.understood && g.knows_era(&self.world.city) {
@@ -691,6 +746,13 @@ fn hud(ui: &mut egui::Ui, w: &Walk, s: &Settings, g: Option<&game::Game>, info: 
     let r = painter.text(at, Align2::CENTER_CENTER, &info.place, FontId::proportional(20.0), Color32::TRANSPARENT);
     painter.rect_filled(r.expand2(egui::vec2(14.0, 5.0)), 6.0, Color32::from_black_alpha(150));
     painter.text(at, Align2::CENTER_CENTER, &info.place, FontId::proportional(20.0), Color32::from_rgba_unmultiplied(236, 228, 208, 235));
+    if let Some(st) = &s.demo_status {
+        let at = Pos2::new(screen.center().x, screen.top() + 52.0);
+        let line = format!("AUTOPILOT · {st} · P or WASD to take over");
+        let r = painter.text(at, Align2::CENTER_CENTER, &line, FontId::proportional(14.0), Color32::TRANSPARENT);
+        painter.rect_filled(r.expand2(egui::vec2(10.0, 4.0)), 5.0, Color32::from_rgba_unmultiplied(90, 60, 10, 190));
+        painter.text(at, Align2::CENTER_CENTER, &line, FontId::proportional(14.0), Color32::from_rgb(255, 214, 120));
+    }
     // Crosshair.
     painter.circle_filled(screen.center(), 2.0, Color32::from_white_alpha(140));
     // Whoever you're looking at.
@@ -731,6 +793,7 @@ fn hud(ui: &mut egui::Ui, w: &Walk, s: &Settings, g: Option<&game::Game>, info: 
                 line(ui, "3. Names float over doors as you pass. Your pick-up glows green, your drop-off amber.");
                 line(ui, "4. Flats are upstairs: go in at the building's street door and take the stairs. \"Flat 3B\" is door B on 3/F; G/F is the ground floor.");
                 line(ui, "5. Stand right in front of the door and press E.");
+                line(ui, "Or press P and watch the courier do the rounds.");
                 line(ui, "6. To know the city: walk its lanes (M shows your notebook) and make deliveries by memory, with G memory mode on and the notebook shut. Then Y moves you on a few years, and the city grows.");
                 ui.add_space(6.0);
                 ui.colored_label(Color32::from_white_alpha(140), "Mouse look · WASD walk · Shift run · Space jump · T torch · N night · Tab city view · H hide this");
@@ -790,8 +853,9 @@ fn hud(ui: &mut egui::Ui, w: &Walk, s: &Settings, g: Option<&game::Game>, info: 
         ui.colored_label(
             Color32::from_white_alpha(110),
             egui::RichText::new(format!(
-                "WASD walk · E knock · M notebook · L ledger · G memory mode · Y move on · T torch ({}) · N night · H help · Tab overview · {fps:.0} fps",
-                if s.torch { "on" } else { "off" }
+                "WASD walk · E knock · P autopilot · M notebook · L ledger · G memory mode · Y move on · T torch ({}) · N night · H help · Tab overview · V vsync ({}) · {fps:.0} fps",
+                if s.torch { "on" } else { "off" },
+                if s.vsync { "on" } else { "off" }
             ))
             .small(),
         );
@@ -940,6 +1004,36 @@ fn screenshot(args: &[String], out: &str) {
         lighting::params(&orbit.camera(), gpu.aspect(), night)
     };
     let texts: Vec<&TextMesh> = walk.as_ref().map_or(vec![], |w| w.text.iter().collect());
+    // `--bench N`: time N frames of this view, part by part.
+    if let Some(n) = arg::<u32>(args, "--bench") {
+        let (mut t_stats, mut t_people, mut t_gpu, mut t_look) = (0.0f64, 0.0f64, 0.0f64, 0.0f64);
+        let look = (params.view_proj.inverse() * glam::Vec4::new(0.0, 0.0, 1.0, 1.0)).truncate().normalize();
+        for i in 0..n {
+            let t = Instant::now();
+            std::hint::black_box(stats::measure(&world.city, year));
+            t_stats += t.elapsed().as_secs_f64();
+            let t = Instant::now();
+            let pm = walk.as_ref().and_then(|w| GpuMesh::upload(&gpu.device, &w.crowd.mesh(params.cam_pos, look, night, i as f32 / 60.0)));
+            t_people += t.elapsed().as_secs_f64();
+            let t = Instant::now();
+            if let Some(w) = walk.as_ref() {
+                std::hint::black_box(w.crowd.looking_at(params.cam_pos, look, night, &w.world));
+            }
+            t_look += t.elapsed().as_secs_f64();
+            let mut ms: Vec<&GpuMesh> = meshes.clone();
+            ms.extend(pm.iter());
+            let t = Instant::now();
+            std::hint::black_box(renderer.capture_with_text(&gpu, &ms, &texts, &params));
+            t_gpu += t.elapsed().as_secs_f64();
+        }
+        let per = |x: f64| x * 1000.0 / n as f64;
+        let verts: u64 = meshes.iter().map(|m| m.count as u64).sum();
+        println!(
+            "per frame: stats {:.2} ms, people {:.2} ms, look-at {:.2} ms, render+readback {:.2} ms ({} meshes, {} indices)",
+            per(t_stats), per(t_people), per(t_look), per(t_gpu), meshes.len(), verts
+        );
+        return;
+    }
     let (w, h, px) = renderer.capture_with_text(&gpu, &meshes, &texts, &params);
     image::RgbaImage::from_raw(w, h, px).unwrap().save(out).expect("save png");
     println!("wrote {out}");
@@ -959,14 +1053,17 @@ fn main() {
     let free_walk = args.iter().any(|a| a == "--walk");
     let overview = args.iter().any(|a| a == "--free");
     let walk_now = !overview;
+    // `--era 1970`: try a later era, with its own save so the real one is untouched.
+    let era = arg::<u16>(&args, "--era").map(|y| game::ERAS.iter().copied().filter(|&e| e <= y.max(START_YEAR)).last().unwrap_or(START_YEAR));
+    let save_file = era.map_or(SAVE_FILE.to_string(), |e| format!("save-{e}.json"));
     // Carry on from the save unless asked for a fresh start (--new).
     let saved = (!args.iter().any(|a| a == "--new"))
-        .then(|| std::fs::read_to_string(SAVE_FILE).ok())
+        .then(|| std::fs::read_to_string(&save_file).ok())
         .flatten()
         .and_then(|s| serde_json::from_str::<game::Save>(&s).ok());
     let game = (!free_walk && !overview).then(|| match saved {
         Some(s) => game::Game::load(s),
-        None => game::Game::new(1987, START_YEAR),
+        None => game::Game::new(1987, era.unwrap_or(START_YEAR)),
     });
     let start_year = game.as_ref().map_or(START_YEAR, |g| g.year);
     let mut app = App {
@@ -986,6 +1083,8 @@ fn main() {
             map_open: false,
             ledger_open: false,
             ledger_pick: None,
+            demo_status: None,
+            vsync: true,
         },
         orbit,
         walk: None,
@@ -993,6 +1092,8 @@ fn main() {
         game,
         signs: signtext::SignText::new(),
         pending_era: None,
+        autopilot: args.iter().any(|a| a == "--demo").then(autopilot::Autopilot::default),
+        save_file,
         started: Instant::now(),
         plane: None,
         people: None,
@@ -1181,6 +1282,57 @@ mod tests {
         }
         assert!(counts[0] > 200, "{counts:?}");
         assert!(counts[2] > counts[0], "1987 should be busier than 1950: {counts:?}");
+    }
+
+    /// The autopilot does real rounds, on foot, in an open 1950 and in the
+    /// 1987 maze of stairs and corridors.
+    #[test]
+    fn autopilot_delivers() {
+        let city = Arc::new(generate(&Params::default()));
+        let soc = kwc_sim::society::generate(&city);
+        for year in [START_YEAR, END_YEAR] {
+            let w = Arc::new(world::build(&city, year).0);
+            let spots = game::spots(&city, &soc, year);
+            let mut g = game::Game::new(1987, year);
+            let mut p = player::Player::new(w.spawn, w.spawn_yaw);
+            let mut ap = autopilot::Autopilot::default();
+            let (dt, mut t, mut lost) = (1.0 / 60.0, 0.0, 0);
+            let wall = std::time::Instant::now();
+            while g.delivered < 3 && t < 900.0 {
+                if g.job.is_none() {
+                    g.new_job(&city, &soc);
+                }
+                // Planning happens on another thread: game time stands still meanwhile.
+                let planning = ap.planning();
+                let (input, act) = ap.drive(&w, &city, year, &mut p, autopilot::target(&g, &spots), if planning { 0.0 } else { dt });
+                if planning {
+                    std::thread::sleep(std::time::Duration::from_millis(2));
+                } else {
+                    p.update(&w, input, dt);
+                    t += dt;
+                }
+                match act {
+                    autopilot::Act::Knock => {
+                        g.interact(&city, &soc, &spots, p.pos);
+                        eprintln!("  {year} t {t:.0}s knock, delivered {} ({:.0?} wall)", g.delivered, wall.elapsed());
+                    }
+                    autopilot::Act::Lost => {
+                        lost += 1;
+                        if let Some(tg) = autopilot::target(&g, &spots) {
+                            let c = ((tg.stand.x / CELL_M) as u16, (tg.stand.z / CELL_M) as u16);
+                            let u = &city.units[tg.unit as usize];
+                            eprintln!("    {}", autopilot::explain(&w, &city, year, p.pos, tg.stand));
+                            eprintln!("    lost: from {:?} to {:?} cell {c:?} {:?} unit floor {} door {:?} picked {}", p.pos, tg.stand, city.ground_at(c), u.floor, u.door, tg.picked);
+                        }
+                        g.job = None;
+                        eprintln!("  {year} t {t:.0}s lost ({:.0?} wall)", wall.elapsed());
+                    }
+                    autopilot::Act::Walk => {}
+                }
+            }
+            eprintln!("{year}: {} deliveries in {t:.0} s, {lost} given up", g.delivered);
+            assert!(g.delivered >= 3 && lost <= 1, "{year}: {} deliveries, {lost} lost, status {}", g.delivered, ap.status);
+        }
     }
 
     /// A save from inside what is now a hut gets you out, not stuck.
