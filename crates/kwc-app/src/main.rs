@@ -78,6 +78,7 @@ struct Walk {
     player: player::Player,
     year: u16,
     spots: Vec<game::Spot>,
+    plates: Vec<game::Plate>,
 }
 
 impl Walk {
@@ -88,7 +89,7 @@ impl Walk {
         lights::bake(city, year, &lamps, &mut [&mut mesh]);
         log::info!("walk world {year}: {} boxes, {} verts in {:.0?}", world.boxes.len(), mesh.vertices.len(), t.elapsed());
         let player = player::Player::new(world.spawn, world.spawn_yaw);
-        Walk { interior: GpuMesh::upload_chunked(&gpu.device, &mesh), world, player, year, spots: game::spots(city, soc, year) }
+        Walk { interior: GpuMesh::upload_chunked(&gpu.device, &mesh), world, player, year, spots: game::spots(city, soc, year), plates: game::plates(city, soc, year) }
     }
 }
 
@@ -354,6 +355,9 @@ struct Label {
 struct HudInfo {
     place: String,
     labels: Vec<Label>,
+    /// Visible painted text, nearest first, with the camera to project it.
+    plates: Vec<usize>,
+    view_proj: glam::Mat4,
     /// Addresses for the job card.
     from_addr: String,
     to_addr: String,
@@ -381,7 +385,7 @@ fn hud_info(wd: &World, w: &Walk, g: Option<&game::Game>, params: &FrameParams, 
     let mut cands: Vec<(f32, &game::Spot)> = w
         .spots
         .iter()
-        .filter(|sp| !memory || matches!(sp.kind, game::SpotKind::Plaque(_)))
+        .filter(|_| false)
         .filter_map(|sp| {
             let d = sp.label - cam.eye;
             let dist = d.length();
@@ -438,8 +442,28 @@ fn hud_info(wd: &World, w: &Walk, g: Option<&game::Game>, params: &FrameParams, 
         let what = if j.picked { "Deliver" } else { "Collect" };
         Some((angle, format!("{what} · {dist:.0} m{vertical}")))
     });
+    // Painted text worth drawing: close, facing us, not behind a wall.
+    let mut plates: Vec<(f32, usize)> = w
+        .plates
+        .iter()
+        .enumerate()
+        .filter_map(|(k, pl)| {
+            let to_eye = cam.eye - pl.centre;
+            let dist = to_eye.length();
+            let ok = dist < 11.0 && pl.normal.dot(to_eye) > 0.05 && (pl.centre - cam.eye).normalize().dot(look) > 0.2;
+            let _ = memory;
+            ok.then_some((dist, k))
+        })
+        .collect();
+    plates.sort_by(|a, b| a.0.total_cmp(&b.0));
+    let plates: Vec<usize> = plates
+        .into_iter()
+        .filter(|&(_, k)| game::line_clear(&w.world, cam.eye, w.plates[k].centre + w.plates[k].normal * 0.12))
+        .take(40)
+        .map(|(_, k)| k)
+        .collect();
     let place = if memory { "Memory mode · plaques only (G to turn off)".to_string() } else { game::place_name(city, soc, year, w.player.pos) };
-    HudInfo { place, labels, from_addr, to_addr, arrow }
+    HudInfo { place, labels, plates, view_proj: params.view_proj, from_addr, to_addr, arrow }
 }
 
 fn hud(ui: &mut egui::Ui, w: &Walk, s: &Settings, g: Option<&game::Game>, info: &HudInfo, fps: f32) {
@@ -478,6 +502,55 @@ fn hud(ui: &mut egui::Ui, w: &Walk, s: &Settings, g: Option<&game::Game>, info: 
         y += ts.y;
         let ss = sub.size();
         painter.galley(Pos2::new(pos.x - ss.x / 2.0, y), sub, paper);
+    }
+
+    // Names painted on the city: each glyph pinned in 3D and projected.
+    let tex = ui.ctx().fonts(|f| f.font_image_size());
+    let uvn = egui::vec2(1.0 / tex[0] as f32, 1.0 / tex[1] as f32);
+    let to_screen = |p: Vec3| -> Option<Pos2> {
+        let c = info.view_proj * p.extend(1.0);
+        (c.w > 0.05).then(|| Pos2::new(screen.left() + (c.x / c.w * 0.5 + 0.5) * screen.width(), screen.top() + (0.5 - c.y / c.w * 0.5) * screen.height()))
+    };
+    let job_target = |kind: game::SpotKind| -> Option<Color32> {
+        let j = g?.job.as_ref()?;
+        match kind {
+            game::SpotKind::Unit(u) if !j.picked && u == j.from => Some(Color32::from_rgb(120, 240, 150)),
+            game::SpotKind::Unit(u) if j.picked && u == j.to => Some(Color32::from_rgb(255, 205, 90)),
+            _ => None,
+        }
+    };
+    for &k in &info.plates {
+        let pl = &w.plates[k];
+        let colour = job_target(pl.kind).unwrap_or(Color32::from_rgb(pl.colour[0], pl.colour[1], pl.colour[2]));
+        let galleys: Vec<_> = pl.lines.iter().filter(|l| !l.is_empty()).map(|l| painter.layout_no_wrap(l.clone(), FontId::proportional(28.0), colour)).collect();
+        if galleys.is_empty() {
+            continue;
+        }
+        let gh = galleys[0].size().y;
+        let widest = galleys.iter().map(|g| g.size().x).fold(0.0, f32::max);
+        let s = (pl.line_h / gh).min(pl.max_w / widest.max(1.0));
+        let total_h = gh * s * galleys.len() as f32;
+        let mut mesh = egui::Mesh::with_texture(egui::TextureId::default());
+        let mut ok = true;
+        for (li, gal) in galleys.iter().enumerate() {
+            let origin = pl.centre - pl.right * (gal.size().x * s / 2.0) + Vec3::Y * (total_h / 2.0 - li as f32 * gh * s);
+            for row in &gal.rows {
+                let base = mesh.vertices.len() as u32;
+                for v in &row.visuals.mesh.vertices {
+                    let gp = row.pos + v.pos.to_vec2();
+                    let world = origin + pl.right * (gp.x * s) - Vec3::Y * (gp.y * s);
+                    let Some(sp) = to_screen(world) else {
+                        ok = false;
+                        break;
+                    };
+                    mesh.vertices.push(egui::epaint::Vertex { pos: sp, uv: Pos2::new(v.uv.x * uvn.x, v.uv.y * uvn.y), color: colour });
+                }
+                mesh.indices.extend(row.visuals.mesh.indices.iter().map(|i| i + base));
+            }
+        }
+        if ok {
+            painter.add(egui::Shape::mesh(mesh));
+        }
     }
 
     // Where you are.

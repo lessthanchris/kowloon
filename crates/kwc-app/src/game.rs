@@ -217,6 +217,98 @@ impl Game {
     }
 }
 
+/// Text painted on a surface: centre, the surface's outward normal, and the
+/// in-plane right/up directions (as a reader facing the wall sees them).
+pub struct Plate {
+    pub centre: Vec3,
+    pub normal: Vec3,
+    pub right: Vec3,
+    pub lines: Vec<String>,
+    /// Height of one line of text, and the widest it may be (m).
+    pub line_h: f32,
+    pub max_w: f32,
+    pub colour: [u8; 3],
+    pub kind: SpotKind,
+}
+
+fn frame(c: Cell, d: Dir) -> (Vec3, Vec3, Vec3) {
+    let (dx, dz) = d.delta();
+    let n = Vec3::new(dx as f32, 0.0, dz as f32);
+    let right = (-n).cross(Vec3::Y);
+    (face_point(c, d), n, right)
+}
+
+/// Every name in the city, painted where it belongs: business names on shop
+/// fascias, flat numbers and family names on doors, addresses over street doors,
+/// lane names on the enamel plaques.
+pub fn plates(city: &City, soc: &Society, year: u16) -> Vec<Plate> {
+    let mut out = vec![];
+    for u in city.units_at(year) {
+        let (p, n, right) = frame(u.door.cell, u.door.facing);
+        let y = u.floor as f32 * S;
+        let a = &soc.directory.address[u.id as usize];
+        let shop = city.step(u.door.cell, u.door.facing).is_some_and(|nb| city.ground_at(nb) == Ground::Alley);
+        let occ = soc.occupants(u.id, year);
+        if shop {
+            let name = match occ.first() {
+                Some(&Occupant::Temple) => u.name.clone().unwrap_or("Temple".into()),
+                Some(&o) => soc.describe(o),
+                None => continue,
+            };
+            out.push(Plate { centre: p + n * 0.045 + Vec3::Y * (y + 2.63), normal: n, right, lines: vec![name], line_h: 0.17, max_w: 1.3, colour: [245, 232, 200], kind: SpotKind::Unit(u.id) });
+        } else {
+            let flat = format!("{}{}", u.floor, a.flat.unwrap_or(' '));
+            let who = match occ.first() {
+                Some(&Occupant::Household(h)) => soc.households[h as usize].surname.clone(),
+                Some(&o) => soc.describe(o),
+                None => String::new(),
+            };
+            out.push(Plate {
+                centre: p + n * 0.15 + Vec3::Y * (y + 1.55),
+                normal: n,
+                right,
+                lines: vec![flat, who],
+                line_h: 0.11,
+                max_w: 0.85,
+                colour: [240, 236, 220],
+                kind: SpotKind::Unit(u.id),
+            });
+        }
+    }
+    for pl in city.plots.iter().filter(|p| p.height_at(year) > 0) {
+        let l = pl.core[0];
+        if let Some((d, _)) = city.neighbours(l).find(|(_, nb)| city.ground_at(*nb) == Ground::Alley) {
+            let (p, n, right) = frame(l, d);
+            let (lane, num) = soc.directory.building[pl.id as usize];
+            out.push(Plate {
+                centre: p + n * 0.03 + Vec3::Y * 2.45,
+                normal: n,
+                right,
+                lines: vec![format!("{num} {}", soc.directory.lane_names[lane as usize])],
+                line_h: 0.13,
+                max_w: 1.35,
+                colour: [230, 225, 210],
+                kind: SpotKind::Building(pl.id),
+            });
+        }
+    }
+    for (b, lane, out_dir) in crate::lights::plaques(city, &soc.directory, year) {
+        let right = (-out_dir).cross(Vec3::Y);
+        let c = (b.min + b.max) * 0.5;
+        out.push(Plate {
+            centre: c + out_dir * 0.02,
+            normal: out_dir,
+            right,
+            lines: vec![soc.directory.lane_names[lane as usize].clone()],
+            line_h: 0.11,
+            max_w: 0.64,
+            colour: [245, 245, 250],
+            kind: SpotKind::Plaque(lane),
+        });
+    }
+    out
+}
+
 /// Is the straight line from `a` to `b` free of walls?
 pub fn line_clear(w: &WalkWorld, a: Vec3, b: Vec3) -> bool {
     let d = b - a;
