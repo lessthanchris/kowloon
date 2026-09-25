@@ -72,6 +72,53 @@ const FAMILY: &[[u8; 3]] = &[
     [60, 255, 230],  // teal
 ];
 
+const FRAME: [f32; 3] = [0.018, 0.016, 0.014];
+
+/// A vertical sign sticking out from the wall over the lane: a dark board with a
+/// column of glowing characters, like the shop signs of the period.
+fn vertical_sign(out: &mut Vec<Fixture>, c: Cell, d: Dir, y: f32, col: [f32; 3], lit: bool, glyphs: i32) {
+    let (a0, a1) = (0.72, 0.78); // thin board, perpendicular to the wall
+    let depth = 0.75;
+    let gh = 0.34;
+    let h = glyphs as f32 * (gh + 0.08) + 0.12;
+    // Bracket and board.
+    out.push(Fixture { aabb: on_wall(c, d, a0 + 0.01, a1 - 0.01, y + h - 0.05, y + h, depth + 0.1), col: FRAME, emit: 0.0 });
+    out.push(Fixture { aabb: on_wall(c, d, a0, a1, y, y + h, depth).shrink_from_wall(d, 0.1), col: FRAME, emit: 0.0 });
+    // Characters, each a little proud of the board on both faces.
+    for k in 0..glyphs {
+        let gy = y + 0.1 + k as f32 * (gh + 0.08);
+        let b = on_wall(c, d, a0 - 0.012, a1 + 0.012, gy, gy + gh, depth - 0.1).shrink_from_wall(d, 0.2);
+        out.push(Fixture { aabb: b, col, emit: if lit { -0.9 } else { -0.04 } });
+    }
+}
+
+/// A signboard flat on the outer wall: dark board, a row of glowing characters.
+fn board_sign(out: &mut Vec<Fixture>, c: Cell, d: Dir, y: f32, col: [f32; 3], lit: bool, glyphs: i32) {
+    out.push(Fixture { aabb: on_wall(c, d, 0.05, 1.45, y, y + 0.8, 0.06), col: FRAME, emit: 0.0 });
+    let gw = 1.3 / glyphs as f32;
+    for k in 0..glyphs {
+        let a = 0.1 + k as f32 * gw;
+        out.push(Fixture { aabb: on_wall(c, d, a + 0.04, a + gw - 0.04, y + 0.12, y + 0.68, 0.075), col, emit: if lit { -0.8 } else { -0.04 } });
+    }
+}
+
+trait FromWall {
+    fn shrink_from_wall(self, d: Dir, amount: f32) -> Self;
+}
+
+impl FromWall for Aabb {
+    /// Pull the wall-side face of a sticking-out box away from the wall.
+    fn shrink_from_wall(mut self, d: Dir, amount: f32) -> Aabb {
+        match d {
+            Dir::N => self.max.z -= amount,
+            Dir::S => self.min.z += amount,
+            Dir::E => self.min.x += amount,
+            Dir::W => self.max.x -= amount,
+        }
+        self
+    }
+}
+
 /// Which main lane a lane cell belongs to (index into `city.lanes`).
 pub fn family(city: &City, dir: &address::Directory, c: Cell) -> Option<usize> {
     let name = dir.lane_at(city, c)?;
@@ -85,7 +132,7 @@ pub fn family_col(k: usize) -> [f32; 3] {
 
 /// Street plaques: where one lane meets another, a blue enamel plaque on the
 /// wall of each. Returns (plaque, lane index in the directory, facing out).
-pub fn plaques(city: &City, dir: &address::Directory) -> Vec<(Aabb, u16, Vec3)> {
+pub fn plaques(city: &City, dir: &address::Directory, year: u16) -> Vec<(Aabb, u16, Vec3)> {
     let mut out = vec![];
     for j in 0..city.d as u16 {
         for i in 0..city.w as u16 {
@@ -96,7 +143,7 @@ pub fn plaques(city: &City, dir: &address::Directory) -> Vec<(Aabb, u16, Vec3)> 
                 continue;
             }
             // On the first wall of this cell.
-            if let Some((d, _)) = city.neighbours(c).find(|(_, n)| city.ground_at(*n) == Ground::Plot && city.height_at(*n, u16::MAX) > 0) {
+            if let Some((d, _)) = city.neighbours(c).find(|(_, n)| city.ground_at(*n) == Ground::Plot && city.height_at(*n, year) > 0) {
                 let (dx, dz) = d.delta();
                 let out_dir = -Vec3::new(dx as f32, 0.0, dz as f32);
                 // Flat against the neighbour's wall, just proud of it.
@@ -191,7 +238,7 @@ fn on_wall(c: Cell, d: Dir, a0: f32, a1: f32, y0: f32, y1: f32, out: f32) -> Aab
 pub fn fixtures(city: &City, year: u16) -> Vec<Fixture> {
     let dir = address::build(city);
     let mut out = landmarks(city);
-    for (b, lane, _) in plaques(city, &dir) {
+    for (b, lane, _) in plaques(city, &dir, year) {
         let _ = lane;
         out.push(Fixture { aabb: b, col: srgb(30, 60, 150), emit: -0.25 });
     }
@@ -223,17 +270,17 @@ pub fn fixtures(city: &City, year: u16) -> Vec<Fixture> {
                             let (a0, a1) = if bulb { (0.65, 0.85) } else { (0.2, 1.3) };
                             out.push(Fixture { aabb: on_wall(c, d, a0, a1, 2.55, 2.65, 0.15), col, emit: 2.0 });
                         }
-                        // A projecting sign on a lower floor.
+                        // A projecting sign on a lower floor, always below this building's roof.
                         if h >= 2 && r(3) < 0.08 {
-                            let f = 1 + (r(4) * 2.0) as i32;
-                            let y = f as f32 * S + 0.6;
+                            let f = 1 + (r(4) * (h - 1).min(2) as f32) as i32;
+                            let y = f as f32 * S + 0.5;
                             let sc = SIGN_COLS[(r(5) * SIGN_COLS.len() as f32) as usize % SIGN_COLS.len()];
                             let lit = r(6) < 0.75;
                             let col = match fam {
                                 Some(k) if r(8) < 0.7 => family_col(k),
                                 _ => srgb(sc[0], sc[1], sc[2]),
                             };
-                            out.push(Fixture { aabb: on_wall(c, d, 0.7, 0.8, y, y + 1.6, 0.9), col, emit: if lit { -1.4 } else { -0.05 } });
+                            vertical_sign(&mut out, c, d, y, col, lit, 2 + (r(9) * 3.0) as i32);
                         }
                     }
                     Ground::Outside => {
@@ -244,11 +291,8 @@ pub fn fixtures(city: &City, year: u16) -> Vec<Fixture> {
                                 let sc = SIGN_COLS[(hash(i as u32, j as u32, f as u32 + 51) * SIGN_COLS.len() as f32) as usize % SIGN_COLS.len()];
                                 let y = f as f32 * S + 0.3;
                                 let lit = hash(i as u32, j as u32, f as u32 + 52) < 0.7;
-                                out.push(Fixture {
-                                    aabb: on_wall(c, d, 0.05, 1.45, y, y + 0.9, 0.08),
-                                    col: srgb(sc[0], sc[1], sc[2]),
-                                    emit: if lit { -1.2 } else { -0.05 },
-                                });
+                                let glyphs = 2 + (hash(i as u32, j as u32, f as u32 + 53) * 3.0) as i32;
+                                board_sign(&mut out, c, d, y, srgb(sc[0], sc[1], sc[2]), lit, glyphs);
                             }
                         }
                     }

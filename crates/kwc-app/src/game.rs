@@ -35,7 +35,7 @@ fn face_point(c: Cell, d: Dir) -> Vec3 {
 
 pub fn spots(city: &City, soc: &Society, year: u16) -> Vec<Spot> {
     let mut out = vec![];
-    for (b, lane, out_dir) in crate::lights::plaques(city, &soc.directory) {
+    for (b, lane, out_dir) in crate::lights::plaques(city, &soc.directory, year) {
         let c = (b.min + b.max) * 0.5;
         out.push(Spot { kind: SpotKind::Plaque(lane), stand: c + out_dir * 0.6 - Vec3::Y * c.y, label: c + out_dir * 0.1 + Vec3::Y * 0.35 });
     }
