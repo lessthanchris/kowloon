@@ -862,7 +862,7 @@ fn hud(ui: &mut egui::Ui, w: &Walk, s: &Settings, g: Option<&game::Game>, info: 
         ui.colored_label(
             Color32::from_white_alpha(110),
             egui::RichText::new(format!(
-                "WASD walk · E knock · P autopilot · M notebook · L ledger · G memory mode · Y move on · T torch ({}) · N night · H help · Tab overview · V vsync ({}) · {fps:.0} fps",
+                "WASD walk · Shift jog · Space hop/vault · S on a ladder slides · E knock · P autopilot · M notebook · L ledger · G memory mode · Y move on · T torch ({}) · N night · H help · Tab overview · V vsync ({}) · {fps:.0} fps",
                 if s.torch { "on" } else { "off" },
                 if s.vsync { "on" } else { "off" }
             ))
@@ -1396,6 +1396,44 @@ mod tests {
         let (slow, fast) = (run(30.0), run(240.0));
         assert_eq!(slow, fast, "30 fps and 240 fps disagree");
         assert!(slow.distance(w.spawn) > 5.0, "the walk went nowhere");
+    }
+
+    /// Space at a drum vaults you over it (and takes its fixed time); at open
+    /// ground it's only a short hop.
+    #[test]
+    fn vault_over_clutter() {
+        let city = generate(&Params::default());
+        let (w, _) = world::build(&city, START_YEAR);
+        let mut vaulted = 0;
+        for piece in world::squatters(&city, START_YEAR).iter().filter(|p| p.solid && p.aabb.max.y < 1.0 && p.aabb.max.y > 0.4) {
+            let b = piece.aabb;
+            let z = (b.min.z + b.max.z) / 2.0;
+            let start = Vec3::new(b.max.x + 0.3, 0.0, z);
+            let beyond = Vec3::new(b.min.x - 0.9, 0.0, z);
+            if w.blocked(&player::Player::aabb_at(start)) || w.blocked(&player::Player::aabb_at(beyond)) {
+                continue;
+            }
+            let mut p = player::Player::new(start, std::f32::consts::PI);
+            settle(&mut p, &w);
+            p.update(&w, player::Input { jump: true, ..Default::default() }, TICK);
+            if !p.is_vaulting() {
+                continue;
+            }
+            let mut ticks = 1;
+            while p.is_vaulting() && ticks < 240 {
+                p.update(&w, player::Input::default(), TICK);
+                ticks += 1;
+            }
+            // Always the vault's fixed time (0.55 s), and over to the far side.
+            let secs = ticks as f32 * TICK;
+            assert!((secs - 0.55).abs() < 0.02, "vault took {secs} s");
+            assert!(p.pos.x < b.min.x, "vault ended short at {:?} (drum {:?})", p.pos, b);
+            vaulted += 1;
+            if vaulted >= 3 {
+                break;
+            }
+        }
+        assert!(vaulted >= 3, "only {vaulted} vaults over 1950 clutter");
     }
 
     /// A save from inside what is now a hut gets you out, not stuck.

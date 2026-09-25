@@ -9,11 +9,17 @@ pub const RADIUS: f32 = 0.22;
 pub const HEIGHT: f32 = 1.7;
 pub const EYE: f32 = 1.58;
 const STEP: f32 = 0.42;
-const WALK: f32 = 2.3;
-const RUN: f32 = 4.8;
+/// A brisk courier's walk, and (Shift) a steady jog: not a sprint.
+const WALK: f32 = 2.5;
+const RUN: f32 = 3.9;
 const CLIMB: f32 = 1.8;
+/// Sliding down a ladder, hands on the rails.
+const SLIDE: f32 = 4.0;
 const GRAVITY: f32 = 18.0;
-const JUMP: f32 = 5.2;
+/// A short hop (about half a metre), not a leap.
+const JUMP: f32 = 4.2;
+/// A vault takes this long whatever it clears: never quicker than going round.
+const VAULT_TIME: f32 = 0.55;
 
 #[derive(Default, Clone, Copy)]
 pub struct Input {
@@ -36,11 +42,39 @@ pub struct Player {
     /// the simulation runs on a fixed tick, the view is interpolated.
     prev: Vec3,
     pub alpha: f32,
+    /// View only (never affects where you are): eye height smoothed over
+    /// stair treads, head bob phase, the dip on landing, the jog's wider view.
+    eye_y: f32,
+    prev_eye_y: f32,
+    bob: f32,
+    bob_amp: f32,
+    dip: f32,
+    dip_v: f32,
+    fov: f32,
+    /// Mid-vault: from, to, the height to clear, and progress 0..1.
+    vault: Option<(Vec3, Vec3, f32, f32)>,
 }
 
 impl Player {
     pub fn new(pos: Vec3, yaw: f32) -> Player {
-        Player { pos, vel: Vec3::ZERO, yaw, pitch: 0.0, on_ground: false, climbing: false, prev: pos, alpha: 1.0 }
+        Player {
+            pos,
+            vel: Vec3::ZERO,
+            yaw,
+            pitch: 0.0,
+            on_ground: false,
+            climbing: false,
+            prev: pos,
+            alpha: 1.0,
+            eye_y: pos.y,
+            prev_eye_y: pos.y,
+            bob: 0.0,
+            bob_amp: 0.0,
+            dip: 0.0,
+            dip_v: 0.0,
+            fov: 72.0,
+            vault: None,
+        }
     }
 
     pub fn aabb_at(p: Vec3) -> Aabb {
@@ -78,20 +112,111 @@ impl Player {
 
     pub fn camera(&self) -> Camera {
         // Between ticks (unless we've just been moved a long way, e.g. unstuck).
-        let at = if self.prev.distance(self.pos) < 2.0 { self.prev.lerp(self.pos, self.alpha) } else { self.pos };
-        let eye = at + Vec3::Y * EYE;
+        let near = self.prev.distance(self.pos) < 2.0;
+        let mut at = if near { self.prev.lerp(self.pos, self.alpha) } else { self.pos };
+        at.y = if near { self.prev_eye_y + (self.eye_y - self.prev_eye_y) * self.alpha } else { self.eye_y };
+        // Head bob: a gentle rise and fall per step, a little sway per stride.
+        let side = Vec3::new(-self.yaw.sin(), 0.0, self.yaw.cos());
+        let bob = Vec3::Y * (self.bob_amp * (self.bob * 2.0).sin()) + side * (self.bob_amp * 0.5 * self.bob.sin());
+        let eye = at + Vec3::Y * (EYE - self.dip) + bob;
         let dir = Vec3::new(self.yaw.cos() * self.pitch.cos(), self.pitch.sin(), self.yaw.sin() * self.pitch.cos());
-        Camera { eye, target: eye + dir, fov_y: 72f32.to_radians(), near: 0.05, far: 2500.0 }
+        Camera { eye, target: eye + dir, fov_y: self.fov.to_radians(), near: 0.05, far: 2500.0 }
     }
 
     pub fn update(&mut self, w: &WalkWorld, input: Input, dt: f32) {
         self.prev = self.pos;
-        // Fixed small substeps keep thin walls and stair edges honest.
-        let mut left = dt.min(0.1);
-        while left > 0.0 {
-            let h = left.min(1.0 / 240.0);
-            self.step(w, input, h);
-            left -= h;
+        self.prev_eye_y = self.eye_y;
+        let falling = self.vel.y;
+        let was_ground = self.on_ground;
+        if self.vault.is_some() {
+            self.vaulting(dt);
+        } else if input.jump && self.on_ground && self.try_vault(w) {
+            // Vaulting instead of hopping.
+        } else {
+            // Fixed small substeps keep thin walls and stair edges honest.
+            let mut left = dt.min(0.1);
+            while left > 0.0 {
+                let h = left.min(1.0 / 240.0);
+                self.step(w, input, h);
+                left -= h;
+            }
+        }
+        self.feel(dt, input, !was_ground && self.on_ground, falling);
+    }
+
+    /// Camera feel, from how you're moving (view only).
+    fn feel(&mut self, dt: f32, input: Input, landed: bool, falling: f32) {
+        // Eye height follows the feet smoothly up and down stairs; big
+        // changes (a fall, a ladder) are followed at once.
+        let gap = self.pos.y - self.eye_y;
+        self.eye_y = if gap.abs() > 1.0 || self.climbing || !self.on_ground { self.pos.y } else { self.eye_y + gap * (dt * 16.0).min(1.0) };
+        let speed = Vec3::new(self.vel.x, 0.0, self.vel.z).length();
+        let moving = self.on_ground && speed > 0.3 && self.vault.is_none();
+        // One bob cycle per two steps (about 1.5 m of stride).
+        self.bob += speed * dt * std::f32::consts::TAU / 1.5;
+        let amp = if moving { 0.018 + 0.01 * (speed / RUN) } else { 0.0 };
+        self.bob_amp += (amp - self.bob_amp) * (dt * 6.0).min(1.0);
+        if landed && falling < -3.0 {
+            self.dip_v = (falling * 0.06).max(-1.4);
+        }
+        // A damped spring back to level.
+        self.dip_v += (-self.dip * 90.0 - self.dip_v * 14.0) * dt;
+        self.dip = (self.dip - self.dip_v * dt).clamp(0.0, 0.3);
+        let fov = if input.run && speed > WALK + 0.2 { 76.0 } else { 72.0 };
+        self.fov += (fov - self.fov) * (dt * 4.0).min(1.0);
+    }
+
+    /// Facing low clutter (a drum, a crate, a railing) with room beyond:
+    /// start a vault over it.
+    fn try_vault(&mut self, w: &WalkWorld) -> bool {
+        let fwd = Vec3::new(self.yaw.cos(), 0.0, self.yaw.sin());
+        let r = RADIUS;
+        let probe = |d: f32, y0: f32, y1: f32| {
+            let c = self.pos + fwd * d;
+            Aabb::new(Vec3::new(c.x - r, self.pos.y + y0, c.z - r), Vec3::new(c.x + r, self.pos.y + y1, c.z + r))
+        };
+        // Something in the way at knee-to-waist height, nothing above it.
+        let Some(top) = [0.45f32, 0.6, 0.75, 0.9, 1.05].into_iter().find(|&h| w.blocked(&probe(0.45, 0.1, h))) else { return false };
+        if w.blocked(&probe(0.45, top + 0.15, top + 0.15 + HEIGHT)) {
+            return false;
+        }
+        // Somewhere to land, about level, a stride or so beyond.
+        for d in [1.1f32, 1.4, 1.7] {
+            let land = self.pos + fwd * d;
+            if w.blocked(&Self::aabb_at(land)) || w.blocked(&Self::aabb_at(land + Vec3::Y * (top + 0.15))) {
+                continue;
+            }
+            let below = Self::aabb_at(land - Vec3::Y * 0.3);
+            if !w.blocked(&below) {
+                continue;
+            }
+            self.vault = Some((self.pos, land, top + 0.15, 0.0));
+            self.vel = Vec3::ZERO;
+            return true;
+        }
+        false
+    }
+
+    pub fn is_vaulting(&self) -> bool {
+        self.vault.is_some()
+    }
+
+    fn vaulting(&mut self, dt: f32) {
+        let Some((a, b, clear, t)) = self.vault else { return };
+        let t = (t + dt / VAULT_TIME).min(1.0);
+        let e = t * t * (3.0 - 2.0 * t);
+        let mut p = a.lerp(b, e);
+        p.y += (t * std::f32::consts::PI).sin() * clear;
+        self.pos = p;
+        if t >= 1.0 {
+            self.pos = b;
+            self.vault = None;
+            self.on_ground = false;
+            // Out of a vault at a walk, never faster: no chaining into speed.
+            let fwd = (b - a).normalize_or_zero();
+            self.vel = fwd * WALK;
+        } else {
+            self.vault = Some((a, b, clear, t));
         }
     }
 
@@ -107,11 +232,14 @@ impl Player {
         self.climbing = w.ladder_at(&Self::aabb_at(self.pos)).is_some() && input.forward.abs() > 0.1;
         if self.climbing {
             self.vel = wish * speed * 0.5;
-            self.vel.y = CLIMB * input.forward.signum();
+            // Up hand over hand; down, slide.
+            self.vel.y = if input.forward > 0.0 { CLIMB } else { -SLIDE };
         } else {
-            // Snappy on the ground, a little drift in the air.
+            // Ease into a walk and out of it; little control in the air (a
+            // hop never gains speed).
             let target = wish * speed;
-            let k = if self.on_ground { 14.0 } else { 2.0 };
+            let speeding_up = target.length_squared() > self.vel.x * self.vel.x + self.vel.z * self.vel.z;
+            let k = if !self.on_ground { 1.5 } else if speeding_up { 7.0 } else { 10.0 };
             let blend = (k * dt).min(1.0);
             self.vel.x += (target.x - self.vel.x) * blend;
             self.vel.z += (target.z - self.vel.z) * blend;
