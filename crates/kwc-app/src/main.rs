@@ -18,6 +18,7 @@ mod prefs;
 mod runs;
 mod player;
 mod signtext;
+mod wayfinding;
 mod world;
 
 use citymesh::ColourMode;

@@ -81,3 +81,4 @@ impl SignText {
         (img.size[0] as u32, img.size[1] as u32, rgba)
     }
 }
+

@@ -14,7 +14,7 @@ const C: f32 = CELL_M;
 /// Floor slab thickness.
 pub const SLAB: f32 = 0.2;
 /// Partition wall thickness.
-const WALL: f32 = 0.1;
+pub const WALL: f32 = 0.1;
 /// Stair: eight risers per half-flight (17.5 cm), half a storey each flight.
 const RISERS: usize = 8;
 /// Stairwell plan (a 3 x 3 m well): a lip at floor level by the landing, the

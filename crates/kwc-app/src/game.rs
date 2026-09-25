@@ -17,6 +17,8 @@ pub enum SpotKind {
     Building(u32),
     /// A street plaque (lane index in the directory).
     Plaque(u16),
+    /// A signpost or a floor number: text only, never a place to knock.
+    Sign,
 }
 
 /// Somewhere with a name: a flat or shop door, or a building's entrance.
@@ -78,6 +80,7 @@ pub fn describe(city: &City, soc: &Society, year: u16, kind: SpotKind) -> (Strin
             (name, addr)
         }
         SpotKind::Plaque(l) => (soc.directory.lane_names[l as usize].clone(), "street sign".into()),
+        SpotKind::Sign => (String::new(), String::new()),
         SpotKind::Building(p) => {
             let (lane, num) = soc.directory.building[p as usize];
             let h = city.plots[p as usize].height_at(year);
@@ -380,6 +383,12 @@ fn frame(c: Cell, d: Dir) -> (Vec3, Vec3, Vec3) {
 /// lane names on the enamel plaques.
 pub fn plates(city: &City, soc: &Society, year: u16) -> Vec<Plate> {
     let mut out = vec![];
+    for sp in crate::wayfinding::signposts(city, year) {
+        out.push(Plate { centre: sp.centre, right: sp.right, lines: sp.lines, line_h: 0.11, max_w: 1.22, colour: [240, 236, 220], kind: SpotKind::Sign });
+    }
+    for (centre, right, text) in crate::wayfinding::floor_marks(city, year) {
+        out.push(Plate { centre, right, lines: vec![text], line_h: 0.22, max_w: 0.9, colour: [235, 200, 90], kind: SpotKind::Sign });
+    }
     for u in city.units_at(year) {
         let (p, n, right) = frame(u.door.cell, u.door.facing);
         let y = u.floor as f32 * S;

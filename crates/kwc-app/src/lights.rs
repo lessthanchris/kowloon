@@ -252,6 +252,10 @@ fn on_wall(c: Cell, d: Dir, a0: f32, a1: f32, y0: f32, y1: f32, out: f32) -> Aab
 pub fn fixtures(city: &City, year: u16) -> Vec<Fixture> {
     let dir = address::build(city);
     let mut out = landmarks(city);
+    // Signpost boards: dark green enamel, like the street plaques' cousins.
+    for sp in crate::wayfinding::signposts(city, year) {
+        out.push(Fixture { aabb: sp.board, col: if sp.gate { srgb(120, 30, 30) } else { srgb(20, 70, 50) }, emit: -0.2 });
+    }
     for (b, lane, _) in plaques(city, &dir, year) {
         let _ = lane;
         out.push(Fixture { aabb: b, col: srgb(30, 60, 150), emit: -0.25 });
