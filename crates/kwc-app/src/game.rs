@@ -320,6 +320,26 @@ pub fn line_clear(w: &WalkWorld, a: Vec3, b: Vec3) -> bool {
     })
 }
 
+/// The lane nearest to a cell, searching outward ring by ring (up to ~9 m).
+fn nearest_lane<'a>(city: &City, soc: &'a Society, c: Cell) -> Option<&'a str> {
+    for r in 1..=6i32 {
+        for dj in -r..=r {
+            for di in -r..=r {
+                if di.abs().max(dj.abs()) != r {
+                    continue;
+                }
+                let (i, j) = (c.0 as i32 + di, c.1 as i32 + dj);
+                if city.in_bounds(i, j) {
+                    if let Some(name) = soc.directory.lane_at(city, (i as u16, j as u16)) {
+                        return Some(name);
+                    }
+                }
+            }
+        }
+    }
+    None
+}
+
 /// Where the player is, in words: a lane, or a building and floor.
 pub fn place_name(city: &City, soc: &Society, year: u16, feet: Vec3) -> String {
     let (i, j) = ((feet.x / C).floor() as i32, (feet.z / C).floor() as i32);
@@ -333,6 +353,14 @@ pub fn place_name(city: &City, soc: &Society, year: u16, feet: Vec3) -> String {
             let p = city.plot_of[city.idx(c)];
             let (lane, num) = soc.directory.building[p as usize];
             let h = city.plots[p as usize].height_at(year) as f32;
+            if h == 0.0 {
+                // Nothing built here yet: name it by the nearest lane, not by the
+                // building that will stand here later.
+                return match nearest_lane(city, soc, c) {
+                    Some(lane) => format!("Open ground off {lane}"),
+                    None => "Open ground".into(),
+                };
+            }
             let lv = (feet.y / S + 0.25).floor();
             let building = format!("{num} {}", soc.directory.lane_names[lane as usize]);
             if feet.y > 0.5 && lv >= h {
