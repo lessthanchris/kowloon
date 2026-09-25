@@ -16,7 +16,7 @@ pub fn heading() -> Vec3 {
 }
 
 /// An oriented box: centre, axes (unit vectors) and half-sizes along them.
-fn obox(m: &mut MeshData, c: Vec3, f: Vec3, r: Vec3, u: Vec3, h: Vec3, col: [f32; 3], emit: f32) {
+pub fn obox(m: &mut MeshData, c: Vec3, f: Vec3, r: Vec3, u: Vec3, h: Vec3, col: [f32; 3], emit: f32) {
     let p = |sf: f32, sr: f32, su: f32| c + f * (h.x * sf) + r * (h.y * sr) + u * (h.z * su);
     let faces = [
         [p(1., -1., -1.), p(1., 1., -1.), p(1., 1., 1.), p(1., -1., 1.)],

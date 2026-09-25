@@ -304,7 +304,8 @@ impl Game {
     }
 
     /// Press E: knock on the nearest door you're standing at.
-    pub fn interact(&mut self, city: &City, soc: &Society, spots: &[Spot], feet: Vec3) {
+    /// Knock on the nearest door. Returns the unit if there was one.
+    pub fn interact(&mut self, city: &City, soc: &Society, spots: &[Spot], feet: Vec3) -> Option<u32> {
         let near = spots
             .iter()
             .filter(|s| matches!(s.kind, SpotKind::Unit(_)))
@@ -313,13 +314,13 @@ impl Game {
             .min_by(|a, b| a.1.total_cmp(&b.1));
         let Some((spot, _, _)) = near else {
             self.toast("There's no door here.");
-            return;
+            return None;
         };
-        let SpotKind::Unit(u) = spot.kind else { return };
+        let SpotKind::Unit(u) = spot.kind else { return None };
         let who = describe(city, soc, self.year, spot.kind).0;
         let Some(job) = &mut self.job else {
             self.toast(format!("{who}: \"Nothing for you today.\""));
-            return;
+            return Some(u);
         };
         if !job.picked && u == job.from {
             job.picked = true;
@@ -350,6 +351,7 @@ impl Game {
         } else {
             self.toast(format!("{who}: \"Not for us, I'm afraid.\""));
         }
+        Some(u)
     }
 }
 

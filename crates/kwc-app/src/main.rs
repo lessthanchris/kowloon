@@ -10,6 +10,7 @@ mod game;
 mod lighting;
 mod lights;
 mod panels;
+mod people;
 mod plane;
 mod player;
 mod signtext;
@@ -91,6 +92,7 @@ struct Walk {
     /// The current job's two doors, painted again in their highlight colours.
     job_text: Option<TextMesh>,
     job_key: Option<(u32, u32, bool)>,
+    crowd: people::Crowd,
 }
 
 impl Walk {
@@ -99,6 +101,8 @@ impl Walk {
         let (world, mut mesh) = world::build(city, year);
         let lamps = lights::collect(city, year);
         lights::bake(city, year, &lamps, &mut [&mut mesh]);
+        let crowd = people::Crowd::new(city, soc, &world, year, &lamps);
+        log::info!("{} people about in {year}", crowd.figures.len());
         log::info!("walk world {year}: {} boxes, {} verts in {:.0?}", world.boxes.len(), mesh.vertices.len(), t.elapsed());
         let player = player::Player::new(world.spawn, world.spawn_yaw);
         let plates = game::plates(city, soc, year);
@@ -115,6 +119,7 @@ impl Walk {
             plates,
             job_text: None,
             job_key: None,
+            crowd,
         }
     }
 }
@@ -158,6 +163,8 @@ struct App {
     pending_era: Option<u16>,
     started: Instant,
     plane: Option<GpuMesh>,
+    /// Everyone near you, posed for this frame.
+    people: Option<GpuMesh>,
     keys: HashSet<KeyCode>,
     drag: Option<MouseButton>,
     last_cursor: Option<(f64, f64)>,
@@ -281,8 +288,13 @@ impl ApplicationHandler for App {
 
 impl App {
     fn interact(&mut self) {
-        let (Some(g), Some(w)) = (self.game.as_mut(), self.walk.as_ref()) else { return };
-        g.interact(&self.world.city, &self.world.society, &w.spots, w.player.pos);
+        let (Some(g), Some(w)) = (self.game.as_mut(), self.walk.as_mut()) else { return };
+        // Whoever lives there comes to the door.
+        if let Some(u) = g.interact(&self.world.city, &self.world.society, &w.spots, w.player.pos) {
+            if let Some(sp) = w.spots.iter().find(|s| s.kind == game::SpotKind::Unit(u)) {
+                w.crowd.greet(&self.world.society, w.year, u, sp.stand, sp.label, w.player.pos);
+            }
+        }
         if g.delivered > 0 {
             self.settings.help = false;
         }
@@ -405,6 +417,7 @@ impl App {
         let input = self.input();
         if let Some(w) = self.walk.as_mut() {
             w.player.update(&w.world, input, dt);
+            w.crowd.update(dt, w.player.pos);
         }
         if let Some(g) = self.game.as_mut() {
             g.tick(dt);
@@ -479,7 +492,11 @@ impl App {
         // The Kai Tak jet, rebuilt where it is this frame.
         let t = self.started.elapsed().as_secs_f32();
         self.plane = plane::mesh(t, citymesh::centre(&self.world.city)).and_then(|m| GpuMesh::upload(&run.gpu.device, &m));
-        let mut meshes: Vec<&GpuMesh> = self.world.mesh.iter().chain(self.plane.iter()).collect();
+        self.people = self.walk.as_ref().and_then(|w| {
+            let cam = w.player.camera();
+            GpuMesh::upload(&run.gpu.device, &w.crowd.mesh(cam.eye, (cam.target - cam.eye).normalize(), s.night, t))
+        });
+        let mut meshes: Vec<&GpuMesh> = self.world.mesh.iter().chain(self.plane.iter()).chain(self.people.iter()).collect();
         let params = match &self.walk {
             Some(w) => {
                 meshes.extend(w.interior.iter());
@@ -493,7 +510,7 @@ impl App {
         let stats = stats::measure(&self.world.city, year);
         let fps = self.fps;
         let walk = self.walk.as_ref();
-        let info = walk.map(|w| hud_info(&self.world, w, self.game.as_ref(), &params, s.memory));
+        let info = walk.map(|w| hud_info(&self.world, w, self.game.as_ref(), &params, s.memory, s.night));
         let game = self.game.as_ref();
         let (city, soc) = (&self.world.city, &self.world.society);
         let progress = game.map(|g| (g.coverage(city), g.clean, g.knows_era(city), g.next_era()));
@@ -546,11 +563,13 @@ struct HudInfo {
     /// Pointer to the current target: screen angle (0 = straight ahead,
     /// clockwise) and a hint ("24 m · up to 3/F").
     arrow: Option<(f32, String)>,
+    /// The person under the crosshair: name, and who they are.
+    person: Option<(String, String)>,
 }
 
 /// Work out what the HUD shows this frame: where you are, and the names of
 /// the doors you can see nearby.
-fn hud_info(wd: &World, w: &Walk, g: Option<&game::Game>, params: &FrameParams, memory: bool) -> HudInfo {
+fn hud_info(wd: &World, w: &Walk, g: Option<&game::Game>, params: &FrameParams, memory: bool, night: bool) -> HudInfo {
     let (city, soc, year) = (&wd.city, &wd.society, w.year);
     let cam = w.player.camera();
     let look = (cam.target - cam.eye).normalize();
@@ -625,7 +644,8 @@ fn hud_info(wd: &World, w: &Walk, g: Option<&game::Game>, params: &FrameParams, 
         Some((angle, format!("{what} · {dist:.0} m{vertical}")))
     });
     let place = if memory { "Memory mode · plaques only (G to turn off)".to_string() } else { game::place_name(city, soc, year, w.player.pos) };
-    HudInfo { place, labels, from_addr, to_addr, arrow }
+    let person = w.crowd.looking_at(cam.eye, look, night, &w.world).map(|(n, a)| (n.to_string(), a.to_string()));
+    HudInfo { place, labels, from_addr, to_addr, arrow, person }
 }
 
 fn hud(ui: &mut egui::Ui, w: &Walk, s: &Settings, g: Option<&game::Game>, info: &HudInfo, fps: f32, progress: Option<(f32, u32, bool, Option<u16>)>) {
@@ -673,6 +693,15 @@ fn hud(ui: &mut egui::Ui, w: &Walk, s: &Settings, g: Option<&game::Game>, info: 
     painter.text(at, Align2::CENTER_CENTER, &info.place, FontId::proportional(20.0), Color32::from_rgba_unmultiplied(236, 228, 208, 235));
     // Crosshair.
     painter.circle_filled(screen.center(), 2.0, Color32::from_white_alpha(140));
+    // Whoever you're looking at.
+    if let Some((name, about)) = &info.person {
+        let c = screen.center() + egui::vec2(0.0, 34.0);
+        let a = painter.text(c, Align2::CENTER_CENTER, name, FontId::proportional(18.0), Color32::TRANSPARENT);
+        let b = painter.text(c + egui::vec2(0.0, 20.0), Align2::CENTER_CENTER, about, FontId::proportional(13.0), Color32::TRANSPARENT);
+        painter.rect_filled(a.union(b).expand2(egui::vec2(10.0, 4.0)), 5.0, Color32::from_black_alpha(150));
+        painter.text(c, Align2::CENTER_CENTER, name, FontId::proportional(18.0), Color32::from_rgb(240, 232, 212));
+        painter.text(c + egui::vec2(0.0, 20.0), Align2::CENTER_CENTER, about, FontId::proportional(13.0), Color32::from_rgb(180, 172, 156));
+    }
 
     // Arrow to the current target.
     if let Some((angle, hint)) = &info.arrow {
@@ -849,6 +878,7 @@ fn screenshot(args: &[String], out: &str) {
     let mut world = World::new(seed);
     world.ensure_mesh(&gpu, year, mode);
     let walk: Option<Walk>;
+    let people_mesh: Option<GpuMesh>;
     let plane_mesh = arg::<f32>(args, "--plane").and_then(|t| plane::mesh(t, citymesh::centre(&world.city))).and_then(|m| GpuMesh::upload(&gpu.device, &m));
     let mut meshes: Vec<&GpuMesh> = world.mesh.iter().chain(plane_mesh.iter()).collect();
     let params = if args.iter().any(|a| a == "--walk") {
@@ -895,7 +925,10 @@ fn screenshot(args: &[String], out: &str) {
             }
         }
         meshes.extend(wk.interior.iter());
-        walk_params(&p.camera(), gpu.aspect(), night, args.iter().any(|a| a == "--torch"))
+        let cam = p.camera();
+        people_mesh = GpuMesh::upload(&gpu.device, &wk.crowd.mesh(cam.eye, (cam.target - cam.eye).normalize(), night, 0.0));
+        meshes.extend(people_mesh.iter());
+        walk_params(&cam, gpu.aspect(), night, args.iter().any(|a| a == "--torch"))
     } else {
         walk = None;
         let mut orbit = default_orbit(&world.city);
@@ -962,6 +995,7 @@ fn main() {
         pending_era: None,
         started: Instant::now(),
         plane: None,
+        people: None,
         keys: HashSet::new(),
         drag: None,
         last_cursor: None,
@@ -1126,6 +1160,27 @@ mod tests {
             eprintln!("coplanar overlap: axis {} +{} at {:.3} m, {:.3} m2, colours {:?} / {:?}", h.0 .0, h.0 .1, h.0 .2 as f32 / 1000.0, h.1, h.2, h.3);
         }
         hits.len()
+    }
+
+    /// People turn up in every era, busier as the city fills, and none of
+    /// them stands inside a wall.
+    #[test]
+    fn people_stand_in_open_space() {
+        let city = generate(&Params::default());
+        let soc = kwc_sim::society::generate(&city);
+        let mut counts = vec![];
+        for year in [START_YEAR, 1965, END_YEAR] {
+            let (w, _) = world::build(&city, year);
+            let lamps = lights::collect(&city, year);
+            let crowd = people::Crowd::new(&city, &soc, &w, year, &lamps);
+            for p in crowd.points() {
+                let q = world::Aabb::new(p + Vec3::new(-0.2, 0.05, -0.2), p + Vec3::new(0.2, 1.5, 0.2));
+                assert!(!w.blocked(&q), "{year}: someone inside a wall at {p:?}");
+            }
+            counts.push(crowd.figures.len());
+        }
+        assert!(counts[0] > 200, "{counts:?}");
+        assert!(counts[2] > counts[0], "1987 should be busier than 1950: {counts:?}");
     }
 
     /// A save from inside what is now a hut gets you out, not stuck.

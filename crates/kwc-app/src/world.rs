@@ -205,7 +205,7 @@ fn only(d: Dir) -> Faces {
     f
 }
 
-fn opposite(d: Dir) -> Dir {
+pub fn opposite(d: Dir) -> Dir {
     match d {
         Dir::N => Dir::S,
         Dir::S => Dir::N,
@@ -881,7 +881,17 @@ pub fn roof_furniture(city: &City, year: u16) -> (Vec<Piece>, Vec<Ladder>) {
 /// its huts until the year it's built over. Nothing solid goes right up
 /// against a building that already stands (its doors must stay reachable).
 pub fn squatters(city: &City, year: u16) -> Vec<Piece> {
+    village(city, year).0
+}
+
+/// Each hut's door (at its foot, on the wall face) and the way it faces.
+pub fn hut_doors(city: &City, year: u16) -> Vec<(Vec3, Vec3)> {
+    village(city, year).1
+}
+
+fn village(city: &City, year: u16) -> (Vec<Piece>, Vec<(Vec3, Vec3)>) {
     let mut out: Vec<Piece> = vec![];
+    let mut doors = vec![];
     let mut put = |aabb: Aabb, col: [f32; 3], faces: Faces, solid: bool, emit: f32| out.push(Piece { aabb, col, faces, solid, emit });
     let built = |c: Cell| city.ground_at(c) == Ground::Plot && city.height_at(c, year) > 0;
     let lane = |c: Cell| city.ground_at(c) != Ground::Plot;
@@ -940,6 +950,8 @@ pub fn squatters(city: &City, year: u16) -> Vec<Piece> {
                     Aabb::new(Vec3::new(px - ex, y0, pz - ez), Vec3::new(px + ex, y1, pz + ez))
                 };
                 let span = if fx != 0.0 { hz } else { hx };
+                let (ax, az) = (fz.abs(), fx.abs());
+                doors.push((Vec3::new(mx + fx * hx + ax * -span * 0.35, 0.0, mz + fz * hz + az * -span * 0.35), Vec3::new(fx, 0.0, fz)));
                 put(panel(-span * 0.35, 0.75, 0.0, 1.85), srgb(58, 44, 34), nb, false, 0.0);
                 if span > 1.0 {
                     let lit = hash(a.0 as u32, a.1 as u32, 605) < 0.6;
@@ -992,7 +1004,7 @@ pub fn squatters(city: &City, year: u16) -> Vec<Piece> {
             }
         }
     }
-    out
+    (out, doors)
 }
 
 /// Kowloon City around the walls: blocks of tenements across a ring road,
