@@ -54,6 +54,9 @@ pub struct Player {
     fov: f32,
     /// Mid-vault: from, to, the height to clear, and progress 0..1.
     vault: Option<(Vec3, Vec3, f32, f32)>,
+    /// From the player's settings: field of view and head bob strength.
+    pub base_fov: f32,
+    pub bob_scale: f32,
 }
 
 impl Player {
@@ -76,6 +79,8 @@ impl Player {
             dip_v: 0.0,
             fov: 72.0,
             vault: None,
+            base_fov: 72.0,
+            bob_scale: 1.0,
         }
     }
 
@@ -122,7 +127,8 @@ impl Player {
         // ticks like everything else.
         let phase = self.prev_bob + (self.bob - self.prev_bob) * self.alpha;
         let side = Vec3::new(-self.yaw.sin(), 0.0, self.yaw.cos());
-        let bob = Vec3::Y * (self.bob_amp * 0.5 * (1.0 - (phase * 2.0).cos())) + side * (self.bob_amp * 0.25 * phase.sin());
+        let amp = self.bob_amp * self.bob_scale;
+        let bob = Vec3::Y * (amp * 0.5 * (1.0 - (phase * 2.0).cos())) + side * (amp * 0.25 * phase.sin());
         let eye = at + Vec3::Y * (EYE - self.dip) + bob;
         let dir = Vec3::new(self.yaw.cos() * self.pitch.cos(), self.pitch.sin(), self.yaw.sin() * self.pitch.cos());
         Camera { eye, target: eye + dir, fov_y: self.fov.to_radians(), near: 0.05, far: 2500.0 }
@@ -169,7 +175,7 @@ impl Player {
         // A damped spring back to level.
         self.dip_v += (-self.dip * 90.0 - self.dip_v * 14.0) * dt;
         self.dip = (self.dip - self.dip_v * dt).clamp(0.0, 0.3);
-        let fov = if input.run && speed > WALK + 0.2 { 76.0 } else { 72.0 };
+        let fov = self.base_fov + if input.run && speed > WALK + 0.2 { 4.0 } else { 0.0 };
         self.fov += (fov - self.fov) * (dt * 4.0).min(1.0);
     }
 

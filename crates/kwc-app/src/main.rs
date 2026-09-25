@@ -14,6 +14,7 @@ mod lights;
 mod panels;
 mod people;
 mod plane;
+mod prefs;
 mod runs;
 mod player;
 mod signtext;
@@ -61,6 +62,11 @@ struct Settings {
     /// Title screen: the code typed in, and the run category chosen.
     title_code: String,
     memory_run: bool,
+    /// The settings panel, and the action waiting for a key to be pressed.
+    settings_open: bool,
+    rebinding: Option<prefs::Action>,
+    /// The controls line, in the player's own keys.
+    keys_line: String,
 }
 
 struct World {
@@ -184,6 +190,7 @@ struct App {
     /// A run in progress, and personal bests.
     race: Option<runs::Run>,
     records: runs::Records,
+    prefs: prefs::Prefs,
     started: Instant,
     plane: Option<GpuMesh>,
     /// Everyone near you, posed for this frame.
@@ -206,7 +213,13 @@ impl ApplicationHandler for App {
             el.create_window(Window::default_attributes().with_title("Kowloon Walled City").with_inner_size(LogicalSize::new(1600.0, 900.0)))
                 .expect("window"),
         );
-        let gpu = Gpu::for_window(window.clone());
+        let mut gpu = Gpu::for_window(window.clone());
+        gpu.set_vsync(self.prefs.vsync);
+        self.settings.vsync = self.prefs.vsync;
+        if self.prefs.fullscreen {
+            window.set_fullscreen(Some(winit::window::Fullscreen::Borderless(None)));
+        }
+        self.settings.keys_line = keys_line(&self.prefs);
         let renderer = Renderer::new(&gpu);
         let gui = Gui::new(&gpu, &window);
         self.run = Some(Running { window, gpu, renderer, gui });
@@ -217,7 +230,8 @@ impl ApplicationHandler for App {
             return;
         }
         if let (DeviceEvent::MouseMotion { delta }, Some(w)) = (event, self.walk.as_mut()) {
-            w.player.look(delta.0 as f32, delta.1 as f32);
+            let k = self.prefs.sensitivity;
+            w.player.look(delta.0 as f32 * k, delta.1 as f32 * k * if self.prefs.invert_y { -1.0 } else { 1.0 });
         }
     }
 
@@ -239,6 +253,22 @@ impl ApplicationHandler for App {
                 let PhysicalKey::Code(code) = event.physical_key else { return };
                 if event.state == ElementState::Pressed {
                     if !event.repeat {
+                        // Settings: the next key pressed is the new binding.
+                        if let Some(a) = self.settings.rebinding.take() {
+                            if code != KeyCode::Escape && prefs::bindable(code) {
+                                self.prefs.bind(a, code);
+                                self.prefs.save();
+                                self.settings.keys_line = keys_line(&self.prefs);
+                            }
+                            return;
+                        }
+                        if code == KeyCode::F11 {
+                            self.prefs.fullscreen = !self.prefs.fullscreen;
+                            self.prefs.save();
+                            run.window.set_fullscreen(self.prefs.fullscreen.then_some(winit::window::Fullscreen::Borderless(None)));
+                        }
+                        let action = self.prefs.action(code);
+                        use prefs::Action as A;
                         match code {
                             // On the title screen, keys are for typing a code.
                             _ if self.title => {}
@@ -252,24 +282,27 @@ impl ApplicationHandler for App {
                                 }
                             }
                             KeyCode::Escape if !self.title => self.to_title(),
-                            KeyCode::KeyR if self.race.is_some() && walking => self.restart_run(),
+                            _ => match action {
+                            Some(A::Restart) if self.race.is_some() && walking => self.restart_run(),
                             // Races are on your own feet and in their own era, and a
                             // Memory race means no help at all.
-                            KeyCode::KeyP | KeyCode::KeyY if self.race.is_some() => {}
-                            KeyCode::KeyG | KeyCode::KeyM | KeyCode::KeyL if self.race.as_ref().is_some_and(|r| r.cat == runs::Category::Memory) => {}
-                            KeyCode::KeyT => self.settings.torch = !self.settings.torch,
-                            KeyCode::KeyN => self.settings.night = !self.settings.night,
-                            KeyCode::KeyV => {
+                            Some(A::Autopilot | A::MoveOn) if self.race.is_some() => {}
+                            Some(A::Memory | A::Notebook | A::Ledger) if self.race.as_ref().is_some_and(|r| r.cat == runs::Category::Memory) => {}
+                            Some(A::Torch) => self.settings.torch = !self.settings.torch,
+                            Some(A::Night) => self.settings.night = !self.settings.night,
+                            Some(A::Vsync) => {
                                 if let Some(run) = self.run.as_mut() {
                                     let on = !run.gpu.vsync();
                                     run.gpu.set_vsync(on);
                                     self.settings.vsync = on;
+                                    self.prefs.vsync = on;
+                                    self.prefs.save();
                                 }
                             }
-                            KeyCode::KeyE if walking => self.interact(),
-                            KeyCode::KeyH => self.settings.help = !self.settings.help,
-                            KeyCode::KeyG => self.settings.memory = !self.settings.memory,
-                            KeyCode::KeyP if walking && self.game.is_some() => {
+                            Some(A::Knock) if walking => self.interact(),
+                            Some(A::Help) => self.settings.help = !self.settings.help,
+                            Some(A::Memory) => self.settings.memory = !self.settings.memory,
+                            Some(A::Autopilot) if walking && self.game.is_some() => {
                                 self.autopilot = match self.autopilot.take() {
                                     Some(_) => None,
                                     None => {
@@ -278,22 +311,23 @@ impl ApplicationHandler for App {
                                     }
                                 };
                             }
-                            KeyCode::KeyM if walking => {
+                            Some(A::Notebook) if walking => {
                                 self.settings.map_open = !self.settings.map_open;
                                 self.settings.ledger_open = false;
                                 self.sync_cursor();
                             }
-                            KeyCode::KeyL if walking => {
+                            Some(A::Ledger) if walking => {
                                 self.settings.ledger_open = !self.settings.ledger_open;
                                 self.settings.map_open = false;
                                 self.sync_cursor();
                             }
-                            // Shift+Y: skip ahead without knowing this era (for trying later years).
-                            KeyCode::KeyY if walking => {
+                            // With Shift: skip ahead without knowing this era (for trying later years).
+                            Some(A::MoveOn) if walking => {
                                 let skip = self.keys.contains(&KeyCode::ShiftLeft) || self.keys.contains(&KeyCode::ShiftRight);
                                 self.move_on(skip)
                             }
                             _ => {}
+                            },
                         }
                     }
                     self.keys.insert(code);
@@ -522,14 +556,13 @@ impl App {
     }
 
     fn input(&self) -> player::Input {
-        let k = |c| self.keys.contains(&c);
+        use prefs::Action as A;
+        let k = |a: A| self.keys.contains(&self.prefs.key(a));
         let axis = |a, b| (k(a) as i32 - k(b) as i32) as f32;
-        player::Input {
-            forward: axis(KeyCode::KeyW, KeyCode::KeyS),
-            strafe: axis(KeyCode::KeyD, KeyCode::KeyA),
-            run: k(KeyCode::ShiftLeft) || k(KeyCode::ShiftRight),
-            jump: k(KeyCode::Space),
-        }
+        // Either Shift jogs while jog is on a Shift.
+        let jog = self.prefs.key(A::Jog);
+        let shift = matches!(jog, KeyCode::ShiftLeft | KeyCode::ShiftRight) && (self.keys.contains(&KeyCode::ShiftLeft) || self.keys.contains(&KeyCode::ShiftRight));
+        player::Input { forward: axis(A::Forward, A::Back), strafe: axis(A::Right, A::Left), run: k(A::Jog) || shift, jump: k(A::Jump) }
     }
 
     fn frame(&mut self) {
@@ -583,6 +616,8 @@ impl App {
         }
         if let Some(w) = self.walk.as_mut() {
             w.player.alpha = self.clock.alpha();
+            w.player.base_fov = self.prefs.fov;
+            w.player.bob_scale = self.prefs.head_bob;
         }
         self.settings.demo_status = self.autopilot.as_ref().map(|a| a.status.clone());
         if let Some(g) = self.game.as_mut() {
@@ -694,6 +729,8 @@ impl App {
         let progress = game.map(|g| (g.coverage(city), g.clean, g.knows_era(city), g.next_era()));
         let pending = self.pending_era;
         let (title, race, records, summary) = (self.title, self.race.as_ref(), &self.records, self.save_summary.as_deref());
+        let prefs = &mut self.prefs;
+        let mut prefs_changed = false;
         let mut action = None;
         let cmds = run.gui.draw(&run.gpu, &run.window, &mut enc, &view, |ui| match (walk, &info) {
             (Some(w), Some(info)) => {
@@ -708,6 +745,7 @@ impl App {
                     panels::ledger(ui, soc, g, &mut s.ledger_pick);
                 }
             }
+            _ if title && s.settings_open => prefs_changed = settings_panel(ui, s, prefs),
             _ if title => action = title_screen(ui, s, records, summary),
             _ => {
                 panel(ui, s, &stats, fps);
@@ -725,6 +763,16 @@ impl App {
         run.gpu.queue.submit(cmds.into_iter().chain([enc.finish()]));
         run.window.pre_present_notify();
         run.gpu.queue.present(frame);
+        if prefs_changed {
+            self.prefs.save();
+            self.settings.keys_line = keys_line(&self.prefs);
+            let run = self.run.as_mut().unwrap();
+            if run.gpu.vsync() != self.prefs.vsync {
+                run.gpu.set_vsync(self.prefs.vsync);
+                self.settings.vsync = self.prefs.vsync;
+            }
+            run.window.set_fullscreen(self.prefs.fullscreen.then_some(winit::window::Fullscreen::Borderless(None)));
+        }
         match action {
             Some(TitleAction::Continue) => self.start_campaign(false),
             Some(TitleAction::NewGame) => self.start_campaign(true),
@@ -732,6 +780,89 @@ impl App {
             None => {}
         }
     }
+}
+
+/// The controls line, in the player's own keys.
+fn keys_line(p: &prefs::Prefs) -> String {
+    use prefs::{key_name as n, Action as A};
+    format!(
+        "{}{}{}{} walk · {} jog · {} hop/vault · {} knock · {} autopilot · {} notebook · {} ledger · {} memory · {} move on · {} torch · {} night · {} help · Esc menu · Tab overview · {} vsync",
+        n(p.key(A::Forward)),
+        n(p.key(A::Left)),
+        n(p.key(A::Back)),
+        n(p.key(A::Right)),
+        n(p.key(A::Jog)),
+        n(p.key(A::Jump)),
+        n(p.key(A::Knock)),
+        n(p.key(A::Autopilot)),
+        n(p.key(A::Notebook)),
+        n(p.key(A::Ledger)),
+        n(p.key(A::Memory)),
+        n(p.key(A::MoveOn)),
+        n(p.key(A::Torch)),
+        n(p.key(A::Night)),
+        n(p.key(A::Help)),
+        n(p.key(A::Vsync)),
+    )
+}
+
+/// Settings: mouse, view, display and keys. Returns true if anything changed.
+fn settings_panel(ui: &mut egui::Ui, s: &mut Settings, p: &mut prefs::Prefs) -> bool {
+    use egui::{Align2, Color32, RichText};
+    let before = serde_json::to_string(&*p).unwrap_or_default();
+    egui::Area::new(egui::Id::new("settings")).anchor(Align2::CENTER_CENTER, [0.0, 0.0]).show(ui.ctx(), |ui| {
+        egui::Frame::new().fill(Color32::from_rgba_unmultiplied(16, 14, 12, 240)).inner_margin(24.0).corner_radius(8.0).show(ui, |ui| {
+            ui.set_width(520.0);
+            ui.colored_label(Color32::from_rgb(236, 228, 208), RichText::new("Settings").size(22.0));
+            ui.add_space(8.0);
+            egui::Grid::new("prefs").num_columns(2).spacing([16.0, 6.0]).show(ui, |ui| {
+                ui.label("Mouse sensitivity");
+                ui.add(egui::Slider::new(&mut p.sensitivity, 0.2..=3.0).fixed_decimals(2));
+                ui.end_row();
+                ui.label("Invert mouse Y");
+                ui.checkbox(&mut p.invert_y, "");
+                ui.end_row();
+                ui.label("Field of view");
+                ui.add(egui::Slider::new(&mut p.fov, 60.0..=95.0).suffix("°").fixed_decimals(0));
+                ui.end_row();
+                ui.label("Head bob");
+                ui.add(egui::Slider::new(&mut p.head_bob, 0.0..=1.5).fixed_decimals(2));
+                ui.end_row();
+                ui.label("Vsync");
+                ui.checkbox(&mut p.vsync, "");
+                ui.end_row();
+                ui.label("Fullscreen (F11)");
+                ui.checkbox(&mut p.fullscreen, "");
+                ui.end_row();
+            });
+            ui.add_space(10.0);
+            ui.colored_label(Color32::from_rgb(236, 228, 208), RichText::new("Keys").size(16.0));
+            ui.colored_label(Color32::from_gray(150), RichText::new("Click a key, then press the new one (Esc cancels). Keys already in use swap over.").small());
+            egui::ScrollArea::vertical().max_height(260.0).show(ui, |ui| {
+                egui::Grid::new("keys").num_columns(2).spacing([16.0, 4.0]).show(ui, |ui| {
+                    for a in prefs::Action::ALL {
+                        ui.label(a.label());
+                        let text = if s.rebinding == Some(a) { "press a key…".to_string() } else { prefs::key_name(p.key(a)) };
+                        if ui.add(egui::Button::new(RichText::new(text).monospace()).min_size(egui::vec2(120.0, 0.0))).clicked() {
+                            s.rebinding = Some(a);
+                        }
+                        ui.end_row();
+                    }
+                });
+            });
+            ui.add_space(10.0);
+            ui.horizontal(|ui| {
+                if ui.button("Reset keys").clicked() {
+                    p.reset_keys();
+                }
+                if ui.button("Done").clicked() {
+                    s.settings_open = false;
+                    s.rebinding = None;
+                }
+            });
+        });
+    });
+    serde_json::to_string(&*p).unwrap_or_default() != before
 }
 
 enum TitleAction {
@@ -804,7 +935,16 @@ fn title_screen(ui: &mut egui::Ui, s: &mut Settings, records: &runs::Records, su
             });
             ui.add_space(14.0);
             ui.vertical_centered(|ui| {
-                ui.colored_label(dim, RichText::new("In game: Esc comes back here · R restarts a race · V vsync").small());
+                if ui.button("Settings").clicked() {
+                    s.settings_open = true;
+                }
+                ui.add_space(6.0);
+                ui.colored_label(dim, RichText::new("In game: Esc comes back here · F11 fullscreen").small());
+                ui.add_space(6.0);
+                ui.colored_label(
+                    Color32::from_gray(130),
+                    RichText::new("Kowloon Walled City was real: some 33,000 people lived in 2.6 hectares until it was cleared in 1993. The layout here is generated and every name is invented.").small().italics(),
+                );
             });
         });
     });
@@ -1067,11 +1207,7 @@ fn hud(ui: &mut egui::Ui, w: &Walk, s: &Settings, g: Option<&game::Game>, info: 
     egui::Area::new(egui::Id::new("keys")).anchor(Align2::LEFT_BOTTOM, [12.0, -10.0]).show(ui.ctx(), |ui| {
         ui.colored_label(
             Color32::from_white_alpha(110),
-            egui::RichText::new(format!(
-                "WASD walk · Shift jog · Space hop/vault · S on a ladder slides · E knock · P autopilot · M notebook · L ledger · G memory mode · Y move on · T torch ({}) · N night · H help · Tab overview · V vsync ({}) · {fps:.0} fps",
-                if s.torch { "on" } else { "off" },
-                if s.vsync { "on" } else { "off" }
-            ))
+            egui::RichText::new(format!("{} · torch {} · {fps:.0} fps", s.keys_line, if s.torch { "on" } else { "off" }))
             .small(),
         );
     });
@@ -1362,6 +1498,9 @@ fn main() {
             course: None,
             title_code: String::new(),
             memory_run: false,
+            settings_open: false,
+            rebinding: None,
+            keys_line: String::new(),
         },
         orbit,
         walk: None,
@@ -1375,6 +1514,7 @@ fn main() {
         save_summary: campaign_summary(),
         race: None,
         records: runs::Records::load(),
+        prefs: prefs::Prefs::load().0,
         started: Instant::now(),
         plane: None,
         people: None,
