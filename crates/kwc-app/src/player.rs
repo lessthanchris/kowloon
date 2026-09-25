@@ -31,11 +31,16 @@ pub struct Player {
     pub pitch: f32,
     pub on_ground: bool,
     pub climbing: bool,
+    /// Where the feet were at the start of the last tick, and how far
+    /// (0..1) the frame being drawn is between that tick and the next:
+    /// the simulation runs on a fixed tick, the view is interpolated.
+    prev: Vec3,
+    pub alpha: f32,
 }
 
 impl Player {
     pub fn new(pos: Vec3, yaw: f32) -> Player {
-        Player { pos, vel: Vec3::ZERO, yaw, pitch: 0.0, on_ground: false, climbing: false }
+        Player { pos, vel: Vec3::ZERO, yaw, pitch: 0.0, on_ground: false, climbing: false, prev: pos, alpha: 1.0 }
     }
 
     pub fn aabb_at(p: Vec3) -> Aabb {
@@ -72,12 +77,15 @@ impl Player {
     }
 
     pub fn camera(&self) -> Camera {
-        let eye = self.pos + Vec3::Y * EYE;
+        // Between ticks (unless we've just been moved a long way, e.g. unstuck).
+        let at = if self.prev.distance(self.pos) < 2.0 { self.prev.lerp(self.pos, self.alpha) } else { self.pos };
+        let eye = at + Vec3::Y * EYE;
         let dir = Vec3::new(self.yaw.cos() * self.pitch.cos(), self.pitch.sin(), self.yaw.sin() * self.pitch.cos());
         Camera { eye, target: eye + dir, fov_y: 72f32.to_radians(), near: 0.05, far: 2500.0 }
     }
 
     pub fn update(&mut self, w: &WalkWorld, input: Input, dt: f32) {
+        self.prev = self.pos;
         // Fixed small substeps keep thin walls and stair edges honest.
         let mut left = dt.min(0.1);
         while left > 0.0 {

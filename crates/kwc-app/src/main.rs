@@ -178,6 +178,7 @@ struct App {
     drag: Option<MouseButton>,
     last_cursor: Option<(f64, f64)>,
     last_frame: Instant,
+    clock: Clock,
     fps: f32,
     frames: u64,
 }
@@ -443,7 +444,7 @@ impl App {
         if std::mem::take(&mut self.settings.want_walk) {
             self.enter_walk();
         }
-        let mut input = self.input();
+        let input = self.input();
         // Demo mode drives until you touch the keys.
         if self.autopilot.is_some() && (input.forward != 0.0 || input.strafe != 0.0) {
             self.autopilot = None;
@@ -451,26 +452,34 @@ impl App {
                 g.toast("You take over.");
             }
         }
-        let mut act = autopilot::Act::Walk;
-        if let (Some(ap), Some(w), Some(g)) = (self.autopilot.as_mut(), self.walk.as_mut(), self.game.as_ref()) {
-            let target = autopilot::target(g, &w.spots);
-            (input, act) = ap.drive(&w.world, &self.world.city, w.year, &mut w.player, target, dt);
+        // The world moves on a fixed tick, the same at any frame rate (fair
+        // runs, replayable inputs); frames draw between the last two ticks.
+        for _ in 0..self.clock.advance(dt) {
+            let mut step = input;
+            let mut act = autopilot::Act::Walk;
+            if let (Some(ap), Some(w), Some(g)) = (self.autopilot.as_mut(), self.walk.as_mut(), self.game.as_ref()) {
+                let target = autopilot::target(g, &w.spots);
+                (step, act) = ap.drive(&w.world, &self.world.city, w.year, &mut w.player, target, TICK);
+            }
+            if let Some(w) = self.walk.as_mut() {
+                w.player.update(&w.world, step, TICK);
+                w.crowd.update(TICK, w.player.pos);
+            }
+            match act {
+                autopilot::Act::Knock => self.interact(),
+                autopilot::Act::Lost => {
+                    if let Some(g) = self.game.as_mut() {
+                        g.job = None;
+                        g.toast("The courier couldn't find a way there, and passed the job on.");
+                    }
+                }
+                autopilot::Act::Walk => {}
+            }
+        }
+        if let Some(w) = self.walk.as_mut() {
+            w.player.alpha = self.clock.alpha();
         }
         self.settings.demo_status = self.autopilot.as_ref().map(|a| a.status.clone());
-        if let Some(w) = self.walk.as_mut() {
-            w.player.update(&w.world, input, dt);
-            w.crowd.update(dt, w.player.pos);
-        }
-        match act {
-            autopilot::Act::Knock => self.interact(),
-            autopilot::Act::Lost => {
-                if let Some(g) = self.game.as_mut() {
-                    g.job = None;
-                    g.toast("The courier couldn't find a way there, and passed the job on.");
-                }
-            }
-            autopilot::Act::Walk => {}
-        }
         if let Some(g) = self.game.as_mut() {
             g.tick(dt);
             if g.job.is_none() {
@@ -923,6 +932,30 @@ fn panel(ui: &mut egui::Ui, s: &mut Settings, st: &stats::Stats, fps: f32) {
 }
 
 const SAVE_FILE: &str = "save.json";
+/// The simulation tick: 120 per second, whatever the frame rate.
+pub const TICK: f32 = 1.0 / 120.0;
+
+/// Turns frame time into whole ticks, carrying the remainder.
+#[derive(Default)]
+struct Clock {
+    acc: f64,
+}
+
+impl Clock {
+    /// Ticks to run for a frame of `dt` seconds.
+    fn advance(&mut self, dt: f32) -> u32 {
+        self.acc += dt as f64;
+        let n = (self.acc / TICK as f64).floor();
+        self.acc -= n * TICK as f64;
+        // Far behind (a hitch): drop the backlog rather than spiral.
+        n.min(12.0) as u32
+    }
+
+    /// How far the frame being drawn is between the last tick and the next.
+    fn alpha(&self) -> f32 {
+        (self.acc / TICK as f64) as f32
+    }
+}
 
 fn arg<T: std::str::FromStr>(args: &[String], name: &str) -> Option<T> {
     args.iter().position(|a| a == name).and_then(|i| args.get(i + 1)).and_then(|v| v.parse().ok())
@@ -1101,6 +1134,7 @@ fn main() {
         drag: None,
         last_cursor: None,
         last_frame: Instant::now(),
+        clock: Clock::default(),
         fps: 60.0,
         frames: 0,
     };
@@ -1333,6 +1367,35 @@ mod tests {
             eprintln!("{year}: {} deliveries in {t:.0} s, {lost} given up", g.delivered);
             assert!(g.delivered >= 3 && lost <= 1, "{year}: {} deliveries, {lost} lost, status {}", g.delivered, ap.status);
         }
+    }
+
+    /// The same inputs, tick by tick, give the same walk whatever the frame
+    /// rate: 30 fps and 240 fps end in exactly the same place.
+    #[test]
+    fn fixed_tick_is_frame_rate_independent() {
+        let city = generate(&Params::default());
+        let (w, _) = world::build(&city, END_YEAR);
+        let run = |fps: f32| {
+            let mut p = player::Player::new(w.spawn, w.spawn_yaw);
+            let mut clock = Clock::default();
+            let mut tick = 0u32;
+            while tick < 1200 {
+                for _ in 0..clock.advance(1.0 / fps) {
+                    // A scripted walk: forward, a turn, a run, a strafe.
+                    let input = player::Input { forward: 1.0, strafe: if tick % 400 > 300 { 1.0 } else { 0.0 }, run: tick % 600 > 200, jump: false };
+                    p.yaw += if tick % 300 < 60 { 0.01 } else { 0.0 };
+                    p.update(&w, input, TICK);
+                    tick += 1;
+                    if tick == 1200 {
+                        break;
+                    }
+                }
+            }
+            p.pos
+        };
+        let (slow, fast) = (run(30.0), run(240.0));
+        assert_eq!(slow, fast, "30 fps and 240 fps disagree");
+        assert!(slow.distance(w.spawn) > 5.0, "the walk went nowhere");
     }
 
     /// A save from inside what is now a hut gets you out, not stuck.
