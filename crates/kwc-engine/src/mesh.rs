@@ -12,11 +12,13 @@ pub struct Vertex {
     pub emit: f32,
     /// Sky exposure: 1 = open air, ~0.1 = deep inside a building.
     pub ao: f32,
+    /// Baked light spill from nearby lamps (linear RGB).
+    pub light: [f32; 3],
 }
 
 impl Vertex {
-    pub const ATTRS: [wgpu::VertexAttribute; 5] =
-        wgpu::vertex_attr_array![0 => Float32x3, 1 => Float32x3, 2 => Float32x3, 3 => Float32, 4 => Float32];
+    pub const ATTRS: [wgpu::VertexAttribute; 6] =
+        wgpu::vertex_attr_array![0 => Float32x3, 1 => Float32x3, 2 => Float32x3, 3 => Float32, 4 => Float32, 5 => Float32x3];
     pub fn layout() -> wgpu::VertexBufferLayout<'static> {
         wgpu::VertexBufferLayout {
             array_stride: std::mem::size_of::<Vertex>() as u64,
@@ -67,7 +69,7 @@ impl MeshData {
         let n = (p[1] - p[0]).cross(p[2] - p[0]).normalize_or_zero();
         let base = self.vertices.len() as u32;
         for v in p {
-            self.vertices.push(Vertex { pos: v.into(), normal: n.into(), color, emit, ao: self.ao });
+            self.vertices.push(Vertex { pos: v.into(), normal: n.into(), color, emit, ao: self.ao, light: [0.0; 3] });
         }
         self.indices.extend_from_slice(&[base, base + 1, base + 2, base, base + 2, base + 3]);
     }

@@ -1,5 +1,6 @@
 use crate::gpu::Gpu;
 use crate::mesh::{GpuMesh, Vertex};
+use crate::post::{Post, HDR};
 use glam::{Mat4, Vec3};
 
 pub const DEPTH: wgpu::TextureFormat = wgpu::TextureFormat::Depth32Float;
@@ -24,6 +25,12 @@ pub struct FrameParams {
     /// Head torch colour (pre-multiplied intensity) and range in metres; range 0 = off.
     pub torch_col: Vec3,
     pub torch_range: f32,
+    /// Tonemap exposure, bloom strength and the HDR level where bloom starts.
+    pub exposure: f32,
+    pub bloom: f32,
+    pub bloom_threshold: f32,
+    /// Strength of the baked lamp spill.
+    pub spill: f32,
 }
 
 #[repr(C)]
@@ -53,9 +60,10 @@ pub struct Renderer {
     depth: wgpu::TextureView,
     size: (u32, u32),
     format: wgpu::TextureFormat,
+    post: Post,
 }
 
-fn targets(device: &wgpu::Device, format: wgpu::TextureFormat, w: u32, h: u32) -> (wgpu::TextureView, wgpu::TextureView) {
+fn targets(device: &wgpu::Device, w: u32, h: u32) -> (wgpu::TextureView, wgpu::TextureView) {
     let mk = |fmt, label| {
         device
             .create_texture(&wgpu::TextureDescriptor {
@@ -70,7 +78,7 @@ fn targets(device: &wgpu::Device, format: wgpu::TextureFormat, w: u32, h: u32) -
             })
             .create_view(&wgpu::TextureViewDescriptor::default())
     };
-    (mk(format, "msaa color"), mk(DEPTH, "depth"))
+    (mk(HDR, "msaa hdr"), mk(DEPTH, "depth"))
 }
 
 impl Renderer {
@@ -136,27 +144,29 @@ impl Renderer {
             fragment: Some(wgpu::FragmentState {
                 module: &module,
                 entry_point: Some("fs_main"),
-                targets: &[Some(wgpu::ColorTargetState { format, blend: None, write_mask: wgpu::ColorWrites::ALL })],
+                targets: &[Some(wgpu::ColorTargetState { format: HDR, blend: None, write_mask: wgpu::ColorWrites::ALL })],
                 compilation_options: Default::default(),
             }),
             multiview_mask: None,
             cache: None,
         });
         let (w, h) = (gpu.config.width, gpu.config.height);
-        let (color_msaa, depth) = targets(device, format, w, h);
-        Renderer { pipeline, ubuf, bind, color_msaa, depth, size: (w, h), format }
+        let (color_msaa, depth) = targets(device, w, h);
+        let post = Post::new(device, format, w, h);
+        Renderer { pipeline, ubuf, bind, color_msaa, depth, size: (w, h), format, post }
     }
 
     pub fn resize(&mut self, device: &wgpu::Device, w: u32, h: u32) {
         if (w, h) != self.size && w > 0 && h > 0 {
-            let (c, d) = targets(device, self.format, w, h);
+            let (c, d) = targets(device, w, h);
             self.color_msaa = c;
             self.depth = d;
             self.size = (w, h);
+            self.post.resize(device, w, h);
         }
     }
 
-    /// Draw the world into `target` (resolved from MSAA), clearing to the fog colour.
+    /// Draw the world (HDR, MSAA), bloom it, and tonemap onto `target`.
     pub fn render(&self, gpu: &Gpu, encoder: &mut wgpu::CommandEncoder, target: &wgpu::TextureView, meshes: &[&GpuMesh], p: &FrameParams) {
         let u = Uniforms {
             view_proj: p.view_proj.to_cols_array_2d(),
@@ -167,7 +177,7 @@ impl Renderer {
             gnd_col: v4(p.gnd_col, 0.0),
             fog_col: v4(p.fog_col, 0.0),
             fog: [p.fog_density, p.fog_height_falloff, p.fog_base, p.emissive_gain],
-            misc: [p.canyon_depth, p.canyon_strength, 0.0, 0.0],
+            misc: [p.canyon_depth, p.canyon_strength, p.spill, 0.0],
             torch: v4(p.torch_col, p.torch_range),
         };
         gpu.queue.write_buffer(&self.ubuf, 0, bytemuck::bytes_of(&u));
@@ -176,7 +186,7 @@ impl Renderer {
             label: Some("world"),
             color_attachments: &[Some(wgpu::RenderPassColorAttachment {
                 view: &self.color_msaa,
-                resolve_target: Some(target),
+                resolve_target: Some(&self.post.scene),
                 ops: wgpu::Operations {
                     load: wgpu::LoadOp::Clear(wgpu::Color { r: fc.x as f64, g: fc.y as f64, b: fc.z as f64, a: 1.0 }),
                     store: wgpu::StoreOp::Discard,
@@ -199,6 +209,8 @@ impl Renderer {
             pass.set_index_buffer(m.ibuf.slice(..), wgpu::IndexFormat::Uint32);
             pass.draw_indexed(0..m.count, 0, 0..1);
         }
+        drop(pass);
+        self.post.run(&gpu.queue, encoder, target, p.bloom_threshold, p.bloom, p.exposure);
     }
 
     /// Render one frame offscreen and read it back as tightly packed RGBA8.

@@ -1,0 +1,291 @@
+//! Light: where the lamps are, and light spill baked into vertices.
+//!
+//! Every light floods outward only through open space (corridor to corridor,
+//! landing to stair, lane to doorway, across bridges and passages), so it never
+//! leaks through a wall. Each vertex then sums the lights that reach its space.
+
+use crate::citymesh::{hash, srgb};
+use crate::world::{Aabb, S};
+use glam::Vec3;
+use kwc_engine::mesh::MeshData;
+use kwc_sim::*;
+use std::collections::{HashMap, VecDeque};
+
+const C: f32 = CELL_M;
+/// Level used for spaces open top to bottom: lanes, stairwells, roofs.
+pub const OPEN: u8 = 255;
+pub type Space = (Cell, u8);
+
+pub struct PointLight {
+    pub pos: Vec3,
+    pub col: Vec3,
+    pub range: f32,
+}
+
+/// A visible lamp or sign: geometry plus the light it gives.
+pub struct Fixture {
+    pub aabb: Aabb,
+    pub col: [f32; 3],
+    /// Emission; negative = a painted sign (keeps its colour by day).
+    pub emit: f32,
+}
+
+fn lin(c: [f32; 3]) -> Vec3 {
+    Vec3::from(c)
+}
+
+/// Is there a fluorescent tube on this storey of a corridor or landing, and is it working?
+pub fn tube(c: Cell, f: i32, landing: bool) -> Option<bool> {
+    (landing || hash(c.0 as u32, c.1 as u32, f as u32) < 0.3).then(|| hash(c.0 as u32 + 7, c.1 as u32, f as u32) < 0.75)
+}
+
+pub fn tube_box(c: Cell, f: i32) -> Aabb {
+    let (x0, z0) = (c.0 as f32 * C, c.1 as f32 * C);
+    let y = f as f32 * S + S - crate::world::SLAB;
+    Aabb::new(Vec3::new(x0 + 0.3, y - 0.06, z0 + 0.7), Vec3::new(x0 + C - 0.3, y - 0.02, z0 + 0.8))
+}
+
+pub const TUBE_COL: [f32; 3] = [0.62, 1.0, 0.74];
+
+const SIGN_COLS: &[[u8; 3]] = &[[255, 60, 70], [255, 90, 180], [80, 255, 140], [70, 220, 255], [255, 190, 60], [240, 240, 255]];
+
+fn centre(c: Cell) -> (f32, f32) {
+    ((c.0 as f32 + 0.5) * C, (c.1 as f32 + 0.5) * C)
+}
+
+/// Wall of cell `c` facing `d`, as a thin box sticking out `out` metres from it.
+fn on_wall(c: Cell, d: Dir, a0: f32, a1: f32, y0: f32, y1: f32, out: f32) -> Aabb {
+    let (x0, z0) = (c.0 as f32 * C, c.1 as f32 * C);
+    let (x1, z1) = (x0 + C, z0 + C);
+    match d {
+        Dir::N => Aabb::new(Vec3::new(x0 + a0, y0, z0 - out), Vec3::new(x0 + a1, y1, z0)),
+        Dir::S => Aabb::new(Vec3::new(x0 + a0, y0, z1), Vec3::new(x0 + a1, y1, z1 + out)),
+        Dir::E => Aabb::new(Vec3::new(x1, y0, z0 + a0), Vec3::new(x1 + out, y1, z0 + a1)),
+        Dir::W => Aabb::new(Vec3::new(x0 - out, y0, z0 + a0), Vec3::new(x0, y1, z0 + a1)),
+    }
+}
+
+/// Lamps on lane walls, signs over the lanes, and signboards on the outer wall
+/// (the Walled City's edge was plastered with dentists' boards).
+pub fn fixtures(city: &City, year: u16) -> Vec<Fixture> {
+    let mut out = vec![];
+    for j in 0..city.d as u16 {
+        for i in 0..city.w as u16 {
+            let c = (i, j);
+            if city.ground_at(c) != Ground::Plot {
+                continue;
+            }
+            let h = city.height_at(c, year) as i32;
+            if h == 0 {
+                continue;
+            }
+            for d in Dir::ALL {
+                let Some(n) = city.step(c, d) else { continue };
+                let r = |k: u32| hash(i as u32 * 4 + d as u32, j as u32, k);
+                match city.ground_at(n) {
+                    Ground::Alley => {
+                        // A bulb or a tube bracketed to the wall above head height.
+                        if r(1) < 0.14 {
+                            let bulb = r(2) < 0.5;
+                            let col = if bulb { srgb(255, 190, 120) } else { TUBE_COL };
+                            let (a0, a1) = if bulb { (0.65, 0.85) } else { (0.2, 1.3) };
+                            out.push(Fixture { aabb: on_wall(c, d, a0, a1, 2.55, 2.65, 0.15), col, emit: 2.0 });
+                        }
+                        // A projecting sign on a lower floor.
+                        if h >= 2 && r(3) < 0.08 {
+                            let f = 1 + (r(4) * 2.0) as i32;
+                            let y = f as f32 * S + 0.6;
+                            let sc = SIGN_COLS[(r(5) * SIGN_COLS.len() as f32) as usize % SIGN_COLS.len()];
+                            let lit = r(6) < 0.75;
+                            let col = srgb(sc[0], sc[1], sc[2]);
+                            out.push(Fixture { aabb: on_wall(c, d, 0.7, 0.8, y, y + 1.6, 0.9), col, emit: if lit { -1.4 } else { -0.05 } });
+                        }
+                    }
+                    Ground::Outside => {
+                        // Signboards on the outer wall, lower half of the building.
+                        let floors = (h / 2).max(1);
+                        for f in 1..floors {
+                            if hash(i as u32 + d as u32 * 977, j as u32, f as u32 + 50) < 0.10 {
+                                let sc = SIGN_COLS[(hash(i as u32, j as u32, f as u32 + 51) * SIGN_COLS.len() as f32) as usize % SIGN_COLS.len()];
+                                let y = f as f32 * S + 0.3;
+                                let lit = hash(i as u32, j as u32, f as u32 + 52) < 0.7;
+                                out.push(Fixture {
+                                    aabb: on_wall(c, d, 0.05, 1.45, y, y + 0.9, 0.08),
+                                    col: srgb(sc[0], sc[1], sc[2]),
+                                    emit: if lit { -1.2 } else { -0.05 },
+                                });
+                            }
+                        }
+                    }
+                    _ => {}
+                }
+            }
+        }
+    }
+    out
+}
+
+/// Which open space a point is in (None = inside something solid).
+pub fn space_of(city: &City, year: u16, p: Vec3) -> Option<Space> {
+    let (i, j) = ((p.x / C).floor() as i32, (p.z / C).floor() as i32);
+    if !city.in_bounds(i, j) {
+        return Some(((0, 0), OPEN)); // the world outside: one big open space
+    }
+    let c = (i as u16, j as u16);
+    match city.ground_at(c) {
+        Ground::Plot => {
+            let h = city.height_at(c, year) as i32;
+            let lv = (p.y / S).floor() as i32;
+            if lv >= h || city.role_at(c) == Role::Stair {
+                return Some((c, OPEN));
+            }
+            let pid = city.plot_of[city.idx(c)];
+            (lv >= 0 && city.circ_at(c, pid, lv as u8)).then_some((c, lv as u8))
+        }
+        Ground::Yamen => None,
+        Ground::Outside => Some(((0, 0), OPEN)),
+        _ => Some((c, OPEN)),
+    }
+}
+
+/// Open spaces directly connected to `s`.
+fn neighbours(city: &City, year: u16, links: &HashMap<Space, Vec<Space>>, s: Space) -> Vec<Space> {
+    let (c, lv) = s;
+    let mut v = links.get(&s).cloned().unwrap_or_default();
+    let open_ground = |n: Cell| matches!(city.ground_at(n), Ground::Alley | Ground::Well);
+    if lv == OPEN {
+        match city.ground_at(c) {
+            Ground::Plot if city.role_at(c) == Role::Stair => {
+                let plot = city.plot_at(c).unwrap();
+                for f in 0..city.height_at(c, year) {
+                    v.push((plot.core[0], f));
+                }
+            }
+            Ground::Plot => {}
+            _ => {
+                for (_, n) in city.neighbours(c) {
+                    if open_ground(n) {
+                        v.push((n, OPEN));
+                    } else if city.role_at(n) == Role::Core && city.height_at(n, year) > 0 {
+                        v.push((n, 0)); // the stair doorway off the lane
+                    }
+                }
+            }
+        }
+        return v;
+    }
+    let pid = city.plot_of[city.idx(c)];
+    for (_, n) in city.neighbours(c) {
+        if city.circ_at(n, pid, lv) {
+            v.push((n, lv));
+        }
+        if city.role_at(c) == Role::Core {
+            if city.plot_of[city.idx(n)] == pid && city.role_at(n) == Role::Stair {
+                v.push((n, OPEN));
+            }
+            if lv == 0 && open_ground(n) {
+                v.push((n, OPEN));
+            }
+        }
+    }
+    v
+}
+
+pub fn collect(city: &City, year: u16) -> Vec<PointLight> {
+    let mut lights = vec![];
+    // Tubes on landings and corridors.
+    for p in city.plots.iter().filter(|p| p.height_at(year) > 0) {
+        let h = p.height_at(year) as i32;
+        for &c in &p.cells {
+            let landing = city.role_at(c) == Role::Core;
+            for f in 0..h {
+                if !city.circ_at(c, p.id, f as u8) {
+                    continue;
+                }
+                if tube(c, f, landing) == Some(true) {
+                    let b = tube_box(c, f);
+                    lights.push(PointLight { pos: (b.min + b.max) * 0.5 - Vec3::Y * 0.1, col: lin(TUBE_COL) * 0.9, range: 3.6 });
+                }
+            }
+        }
+    }
+    // Open doors and shopfronts.
+    for u in city.units_at(year).filter(|u| u.door_state == DoorState::Open) {
+        let (cx, cz) = centre(u.door.cell);
+        let (dx, dz) = u.door.facing.delta();
+        let pos = Vec3::new(cx + dx as f32 * C * 0.75, u.floor as f32 * S + 1.4, cz + dz as f32 * C * 0.75);
+        let shop = city.step(u.door.cell, u.door.facing).is_some_and(|n| city.ground_at(n) == Ground::Alley);
+        let warm = hash(u.id, 3, 3) < 0.5;
+        let col = if warm { lin(srgb(255, 200, 140)) } else { lin(srgb(210, 255, 225)) };
+        lights.push(PointLight { pos, col: col * if shop { 1.2 } else { 0.6 }, range: if shop { 4.5 } else { 2.5 } });
+    }
+    // Lamps and lit signs.
+    for fx in fixtures(city, year) {
+        if fx.emit.abs() > 0.5 {
+            let pos = (fx.aabb.min + fx.aabb.max) * 0.5;
+            lights.push(PointLight { pos, col: lin(fx.col) * 0.9, range: 4.5 });
+        }
+    }
+    lights
+}
+
+/// Bake light spill into `mesh` vertices.
+pub fn bake(city: &City, year: u16, lights: &[PointLight], meshes: &mut [&mut MeshData]) {
+    // Bridges and passages join spaces across buildings.
+    let mut links: HashMap<Space, Vec<Space>> = HashMap::new();
+    for br in city.bridges.iter().filter(|b| b.year <= year) {
+        let mut chain: Vec<Space> = vec![(br.a, br.floor)];
+        chain.extend(br.span.iter().map(|&c| (c, OPEN)));
+        chain.push((br.b, br.floor));
+        for w in chain.windows(2) {
+            links.entry(w[0]).or_default().push(w[1]);
+            links.entry(w[1]).or_default().push(w[0]);
+        }
+    }
+    // Flood each light through open space, limited by its range.
+    let mut reach: HashMap<Space, Vec<u32>> = HashMap::new();
+    for (k, l) in lights.iter().enumerate() {
+        let Some(s0) = space_of(city, year, l.pos) else { continue };
+        let steps = (l.range / C).ceil() as u32 + 1;
+        let mut seen = HashMap::from([(s0, 0u32)]);
+        let mut q = VecDeque::from([s0]);
+        while let Some(s) = q.pop_front() {
+            reach.entry(s).or_default().push(k as u32);
+            let d = seen[&s];
+            if d >= steps || s.0 == (0, 0) && s.1 == OPEN {
+                continue;
+            }
+            for n in neighbours(city, year, &links, s) {
+                let (nx, nz) = centre(n.0);
+                if Vec3::new(nx - l.pos.x, 0.0, nz - l.pos.z).length() > l.range + C {
+                    continue;
+                }
+                if !seen.contains_key(&n) {
+                    seen.insert(n, d + 1);
+                    q.push_back(n);
+                }
+            }
+        }
+    }
+    for mesh in meshes.iter_mut() {
+        for v in mesh.vertices.iter_mut() {
+            let p = Vec3::from(v.pos);
+            let n = Vec3::from(v.normal);
+            let Some(s) = space_of(city, year, p + n * 0.05) else { continue };
+            let Some(ids) = reach.get(&s) else { continue };
+            let mut acc = Vec3::ZERO;
+            for &k in ids {
+                let l = &lights[k as usize];
+                let to = l.pos - p;
+                let d = to.length();
+                if d >= l.range {
+                    continue;
+                }
+                let fall = (1.0 - d / l.range).powi(2);
+                let wrap = (n.dot(to / d.max(1e-3)) * 0.7 + 0.3).max(0.0);
+                acc += l.col * fall * wrap;
+            }
+            v.light = acc.into();
+        }
+    }
+}

@@ -204,12 +204,16 @@ pub fn build(city: &City, year: u16, mode: ColourMode) -> MeshData {
                     let stain = 0.82 + 0.3 * hash(i as u32 ^ (f as u32) << 16, j as u32, dir as u32);
                     m.cuboid(Vec3::new(x0, y0, z0), Vec3::new(x1, y1, z1), mul(base, stain), 0.0, face);
 
-                    if g == Ground::Plot && exterior && y1 - y0 > 2.0 {
+                    // No windows at street level: that's shopfronts and doors.
+                    if g == Ground::Plot && exterior && y1 - y0 > 2.0 && f > 0 {
                         window(&mut m, (x0, z0, x1, z1), dir, y0, i, j, f, year);
                     }
                 }
             }
         }
+    }
+    for fx in crate::lights::fixtures(city, year) {
+        m.cuboid(fx.aabb.min, fx.aabb.max, fx.col, fx.emit, Faces::ALL);
     }
     let (pieces, _) = crate::world::roof_furniture(city, year);
     for p in pieces {

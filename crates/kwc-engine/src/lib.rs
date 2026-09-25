@@ -7,6 +7,7 @@ pub mod camera;
 pub mod gpu;
 pub mod gui;
 pub mod mesh;
+pub mod post;
 pub mod renderer;
 
 pub use camera::{Camera, OrbitCamera};

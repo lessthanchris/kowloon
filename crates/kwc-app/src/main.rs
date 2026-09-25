@@ -7,6 +7,7 @@
 
 mod citymesh;
 mod lighting;
+mod lights;
 mod player;
 mod world;
 
@@ -53,7 +54,9 @@ impl World {
             return;
         }
         let t = Instant::now();
-        let data = citymesh::build(&self.city, year, mode);
+        let mut data = citymesh::build(&self.city, year, mode);
+        let lamps = lights::collect(&self.city, year);
+        lights::bake(&self.city, year, &lamps, &mut [&mut data]);
         self.mesh = GpuMesh::upload(&gpu.device, &data);
         log::info!("mesh {year}: {} verts in {:.0?}", data.vertices.len(), t.elapsed());
         self.built_for = Some(key);
@@ -71,7 +74,9 @@ struct Walk {
 impl Walk {
     fn new(gpu: &Gpu, city: &City, year: u16) -> Walk {
         let t = Instant::now();
-        let (world, mesh) = world::build(city, year);
+        let (world, mut mesh) = world::build(city, year);
+        let lamps = lights::collect(city, year);
+        lights::bake(city, year, &lamps, &mut [&mut mesh]);
         log::info!("walk world {year}: {} boxes, {} verts in {:.0?}", world.boxes.len(), mesh.vertices.len(), t.elapsed());
         let player = player::Player::new(world.spawn, world.spawn_yaw);
         Walk { interior: GpuMesh::upload(&gpu.device, &mesh), world, player, year }
@@ -89,9 +94,10 @@ fn walk_params(cam: &Camera, aspect: f32, night: bool, torch: bool) -> FramePara
     p.canyon_depth = 30.0;
     p.canyon_strength = 0.8;
     if torch {
-        p.torch_col = Vec3::new(0.75, 0.7, 0.6);
-        p.torch_range = 8.0;
+        p.torch_col = Vec3::new(0.45, 0.42, 0.36);
+        p.torch_range = 7.0;
     }
+    p.exposure *= 1.15;
     p
 }
 

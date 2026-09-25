@@ -48,8 +48,10 @@ pub fn rng_for(seed: u64, tag: u64) -> ChaCha8Rng {
 pub fn generate(params: &Params) -> City {
     let mut city = layout::build(params);
     growth::grow(&mut city);
-    units::subdivide(&mut city);
+    // Links carve corridors, so they come before the floors are split into units.
+    circulation::add_passages(&mut city);
     circulation::add_bridges(&mut city);
+    units::subdivide(&mut city);
     features::place(&mut city);
     city
 }

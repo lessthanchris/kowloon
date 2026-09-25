@@ -29,8 +29,6 @@ pub enum Role {
     /// Stair shaft beside the landing: a steep dog-leg from each floor to the next,
     /// ending in a stair hut on the roof.
     Stair,
-    /// Landing/corridor linking rooms to the core.
-    Corridor,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash, Serialize, Deserialize)]
@@ -163,6 +161,9 @@ pub struct City {
     pub ground: Vec<Ground>,
     pub plot_of: Vec<u32>,
     pub role: Vec<Role>,
+    /// Per cell, a bit per floor: is it corridor on that floor? Corridors differ
+    /// floor to floor.
+    pub corr: Vec<u16>,
     pub plots: Vec<Plot>,
     pub units: Vec<Unit>,
     pub bridges: Vec<Bridge>,
@@ -195,6 +196,23 @@ impl City {
     }
     pub fn role_at(&self, c: Cell) -> Role {
         self.role[self.idx(c)]
+    }
+    pub fn is_corridor(&self, c: Cell, floor: u8) -> bool {
+        floor < 16 && (self.corr[self.idx(c)] >> floor) & 1 == 1
+    }
+    pub fn set_corridor(&mut self, c: Cell, floor: u8) {
+        let k = self.idx(c);
+        self.corr[k] |= 1 << floor;
+    }
+    /// Walkable circulation of plot `pid` on `floor`: its landing, or a corridor there.
+    pub fn circ_at(&self, c: Cell, pid: u32, floor: u8) -> bool {
+        let k = self.idx(c);
+        self.plot_of[k] == pid && (self.role[k] == Role::Core || self.is_corridor(c, floor))
+    }
+    /// A room (part of some unit) of plot `pid` on `floor`.
+    pub fn room_at(&self, c: Cell, pid: u32, floor: u8) -> bool {
+        let k = self.idx(c);
+        self.plot_of[k] == pid && self.role[k] == Role::Room && !self.is_corridor(c, floor)
     }
     pub fn plot_at(&self, c: Cell) -> Option<&Plot> {
         let p = self.plot_of[self.idx(c)];

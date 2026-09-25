@@ -21,6 +21,10 @@ pub fn params(cam: &Camera, aspect: f32, night: bool) -> FrameParams {
         canyon_strength: 0.65,
         torch_col: Vec3::ZERO,
         torch_range: 0.0,
+        exposure: 1.0,
+        bloom: 0.6,
+        bloom_threshold: 1.0,
+        spill: 0.5,
     };
     if !night {
         return base;
@@ -33,6 +37,8 @@ pub fn params(cam: &Camera, aspect: f32, night: bool) -> FrameParams {
         fog_col: Vec3::new(0.035, 0.035, 0.055),
         fog_density: 0.0016,
         emissive_gain: 1.3,
+        spill: 1.0,
+        exposure: 1.2,
         canyon_strength: 0.8,
         ..base
     }

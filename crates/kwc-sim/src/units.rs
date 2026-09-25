@@ -22,15 +22,15 @@ pub fn subdivide(city: &mut City) {
     city.units = units;
 }
 
-fn is_circulation(city: &City, c: Cell, plot: u32) -> bool {
-    city.plot_of[city.idx(c)] == plot && matches!(city.role_at(c), Role::Core | Role::Corridor)
+fn is_circulation(city: &City, c: Cell, plot: u32, floor: u8) -> bool {
+    city.circ_at(c, plot, floor)
 }
 
 fn floor_units(city: &City, p: usize, floor: u8, rng: &mut impl Rng, out: &mut Vec<Unit>) {
     let pid = p as u32;
-    let is_room = |c: Cell| city.plot_of[city.idx(c)] == pid && city.role_at(c) == Role::Room;
+    let is_room = |c: Cell| city.room_at(c, pid, floor);
     let doorable = |c: Cell| {
-        city.neighbours(c).any(|(_, n)| is_circulation(city, n, pid) || (floor == 0 && city.ground_at(n) == Ground::Alley))
+        city.neighbours(c).any(|(_, n)| is_circulation(city, n, pid, floor) || (floor == 0 && city.ground_at(n) == Ground::Alley))
     };
     let rooms: Vec<Cell> = city.plots[p].cells.iter().copied().filter(|&c| is_room(c)).collect();
     // Units start from cells with a way out, then grow into back rooms.
@@ -79,7 +79,7 @@ fn floor_units(city: &City, p: usize, floor: u8, rng: &mut impl Rng, out: &mut V
     }
 
     // Pokey leftovers (under ~18 m²) knock through into their smallest neighbour.
-    const MIN_UNIT: usize = 8;
+    const MIN_UNIT: usize = 12;
     let mut lonely = std::collections::HashSet::new();
     while let Some(g) = (0..groups.len()).find(|&g| !groups[g].is_empty() && groups[g].len() < MIN_UNIT && !lonely.contains(&g)) {
         let mut best: Option<usize> = None;
@@ -115,7 +115,7 @@ fn floor_units(city: &City, p: usize, floor: u8, rng: &mut impl Rng, out: &mut V
             for (d, n) in city.neighbours(c) {
                 if floor == 0 && city.ground_at(n) == Ground::Alley {
                     alley_doors.push(Door { cell: c, facing: d });
-                } else if is_circulation(city, n, pid) {
+                } else if is_circulation(city, n, pid, floor) {
                     inner_doors.push(Door { cell: c, facing: d });
                 }
             }

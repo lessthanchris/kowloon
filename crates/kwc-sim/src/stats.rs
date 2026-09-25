@@ -42,6 +42,6 @@ pub fn measure(city: &City, year: u16) -> Stats {
         frac_10_plus: hs.iter().filter(|&&h| h >= 10).count() as f32 / hs.len() as f32,
         lane_share: count(Ground::Alley) / inside,
         well_share: count(Ground::Well) / inside,
-        corridor_share: city.role.iter().filter(|r| **r == Role::Corridor).count() as f32 / bcells,
+        corridor_share: city.corr.iter().map(|m| m.count_ones()).sum::<u32>() as f32 / (bcells * MAX_FLOORS as f32),
     }
 }

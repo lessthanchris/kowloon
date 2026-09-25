@@ -17,7 +17,7 @@ use std::collections::{BinaryHeap, HashMap, VecDeque};
 /// Minimum plot size in cells (~27 m²); smaller leftovers merge or become wells.
 const MIN_PLOT: usize = 12;
 /// How far (cells, through rooms) a room may sit from a corridor or stair.
-const ROOM_REACH: u32 = 4;
+const ROOM_REACH: u32 = 6;
 
 pub fn build(params: &Params) -> City {
     let site = Site::load();
@@ -30,6 +30,7 @@ pub fn build(params: &Params) -> City {
         ground: vec![Ground::Outside; w * d],
         plot_of: vec![NO_PLOT; w * d],
         role: vec![Role::None; w * d],
+        corr: vec![0; w * d],
         plots: vec![],
         units: vec![],
         bridges: vec![],
@@ -549,20 +550,50 @@ fn lay_out_circulation(city: &mut City, p: usize, rng: &mut impl Rng) -> bool {
         }
     }
     let Some((_, landing, stair)) = best else { return false };
-    let (depth, parent) = bfs_in_plot(city, pid, &[landing], Some(stair));
 
     for &c in &cells {
         let k = city.idx(c);
         city.role[k] = Role::Room;
+        city.corr[k] = 0;
     }
     let k = city.idx(landing);
     city.role[k] = Role::Core;
     let k = city.idx(stair);
     city.role[k] = Role::Stair;
-    let core = vec![landing, stair];
+    city.plots[p].core = vec![landing, stair];
 
-    let circ = |city: &City, x: Cell| city.plot_of[city.idx(x)] == pid && matches!(city.role_at(x), Role::Core | Role::Corridor);
-    // Room-distance from `c` to a room touching circulation (None if > ROOM_REACH).
+    // Every floor gets its own corridors: buildings were fitted out (and
+    // re-partitioned) floor by floor, so no two storeys need look the same.
+    for f in 0..MAX_FLOORS as u8 {
+        lay_out_floor(city, pid, &cells, landing, stair, f, rng);
+    }
+    true
+}
+
+/// Corridors for one floor: walk outward from the landing; a room too far from
+/// circulation extends a corridor towards it along a (per-floor random) BFS
+/// tree, stopping once it touches existing circulation. Then a few dead-end
+/// stubs wander off, as corridors in the Walled City did.
+fn lay_out_floor(city: &mut City, pid: u32, cells: &[Cell], landing: Cell, stair: Cell, f: u8, rng: &mut impl Rng) {
+    // Randomised BFS tree from the landing.
+    let mut depth: HashMap<Cell, u32> = HashMap::from([(landing, 0)]);
+    let mut parent: HashMap<Cell, Cell> = HashMap::new();
+    let mut q = VecDeque::from([landing]);
+    while let Some(c) = q.pop_front() {
+        let mut ns: Vec<Cell> = city.neighbours(c).map(|x| x.1).collect();
+        ns.shuffle(rng);
+        for n in ns {
+            if city.plot_of[city.idx(n)] == pid && n != stair && !depth.contains_key(&n) {
+                depth.insert(n, depth[&c] + 1);
+                parent.insert(n, c);
+                q.push_back(n);
+            }
+        }
+    }
+    let circ = |city: &City, x: Cell| city.circ_at(x, pid, f);
+    let room = |city: &City, x: Cell| city.room_at(x, pid, f);
+    // Room-distance from `c` to a room touching circulation (None if > reach).
+    let reach_limit = rng.gen_range(4..=ROOM_REACH);
     let reach = |city: &City, c: Cell| -> Option<u32> {
         let mut seen = HashMap::from([(c, 0u32)]);
         let mut q = VecDeque::from([c]);
@@ -571,11 +602,11 @@ fn lay_out_circulation(city: &mut City, p: usize, rng: &mut impl Rng) -> bool {
             if city.neighbours(x).any(|(_, n)| circ(city, n)) {
                 return Some(dx);
             }
-            if dx >= ROOM_REACH {
+            if dx >= reach_limit {
                 continue;
             }
             for (_, n) in city.neighbours(x) {
-                if city.plot_of[city.idx(n)] == pid && city.role_at(n) == Role::Room && !seen.contains_key(&n) {
+                if room(city, n) && !seen.contains_key(&n) {
                     seen.insert(n, dx + 1);
                     q.push_back(n);
                 }
@@ -584,25 +615,22 @@ fn lay_out_circulation(city: &mut City, p: usize, rng: &mut impl Rng) -> bool {
         None
     };
 
-    // Walk outward; a room too far from circulation extends a corridor towards it
-    // along the BFS tree, stopping as soon as the corridor touches existing circulation.
-    let mut by_depth: Vec<Cell> = cells.iter().copied().filter(|&c| c != stair).collect();
+    let mut by_depth: Vec<Cell> = cells.iter().copied().filter(|c| depth.contains_key(c) && *c != landing).collect();
     by_depth.shuffle(rng);
     by_depth.sort_by_key(|c| depth[c]);
-    for c in by_depth {
-        if city.role_at(c) != Role::Room || reach(city, c).is_some() {
+    for &c in &by_depth {
+        if !room(city, c) || reach(city, c).is_some() {
             continue;
         }
         let mut prev = c;
         let mut x = parent[&c];
         loop {
-            let k = city.idx(x);
-            if city.role[k] != Role::Room {
+            if !room(city, x) {
                 break;
             }
             // Touching circulation *other than* the corridor this chain just laid.
             let touching = city.neighbours(x).any(|(_, n)| n != prev && circ(city, n));
-            city.role[k] = Role::Corridor;
+            city.set_corridor(x, f);
             if touching {
                 break;
             }
@@ -610,8 +638,20 @@ fn lay_out_circulation(city: &mut City, p: usize, rng: &mut impl Rng) -> bool {
             x = parent[&x];
         }
     }
-    city.plots[p].core = core;
-    true
+
+    // Dead-end stubs: a corridor pushes a couple of cells further into the rooms.
+    if f > 0 && rng.gen::<f32>() < 0.45 {
+        let starts: Vec<Cell> = cells.iter().copied().filter(|&c| circ(city, c)).collect();
+        if let Some(&s) = starts.choose(rng) {
+            let mut x = s;
+            for _ in 0..rng.gen_range(1..=3) {
+                let next: Vec<Cell> = city.neighbours(x).map(|n| n.1).filter(|&n| room(city, n)).collect();
+                let Some(&n) = next.choose(rng) else { break };
+                city.set_corridor(n, f);
+                x = n;
+            }
+        }
+    }
 }
 
 fn path_to_alley(city: &City, noise: &[f32], from: Cell) -> Option<Vec<Cell>> {

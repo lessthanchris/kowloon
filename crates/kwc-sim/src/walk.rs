@@ -9,26 +9,27 @@ use std::collections::{HashSet, VecDeque};
 /// floor `f`; level `h` on a building of height `h` is its roof.
 pub type Node = (Cell, u8);
 
-fn circ(city: &City, c: Cell, plot: u32) -> bool {
-    let k = city.idx(c);
-    city.plot_of[k] == plot && matches!(city.role[k], Role::Core | Role::Corridor)
-}
 
+/// Everywhere reachable from the lane openings on the edge of the site.
 pub fn reachable(city: &City, year: u16) -> HashSet<Node> {
-    let mut seen: HashSet<Node> = HashSet::new();
-    let mut q = VecDeque::new();
-    // Start from every lane cell on the edge of the site.
+    let mut starts = vec![];
     for j in 0..city.d as u16 {
         for i in 0..city.w as u16 {
             let c = (i, j);
             if city.ground_at(c) == Ground::Alley
                 && crate::Dir::ALL.iter().any(|&d| city.step(c, d).map_or(true, |n| city.ground_at(n) == Ground::Outside))
             {
-                seen.insert((c, 0));
-                q.push_back((c, 0u8));
+                starts.push((c, 0u8));
             }
         }
     }
+    search(city, year, starts, &|_| true)
+}
+
+/// Breadth-first over the walkable graph, only through nodes `allow` accepts.
+pub fn search(city: &City, year: u16, starts: Vec<Node>, allow: &dyn Fn(Node) -> bool) -> HashSet<Node> {
+    let mut seen: HashSet<Node> = starts.iter().copied().collect();
+    let mut q: VecDeque<Node> = starts.into();
     let bridges: Vec<&Bridge> = city.bridges.iter().filter(|b| b.year <= year).collect();
 
     while let Some((c, lv)) = q.pop_front() {
@@ -50,7 +51,7 @@ pub fn reachable(city: &City, year: u16) -> HashSet<Node> {
             Ground::Plot if lv < h => {
                 // Inside: move along this floor's circulation, up/down the core.
                 for (_, n) in city.neighbours(c) {
-                    if circ(city, n, pid) {
+                    if city.circ_at(n, pid, lv) {
                         next.push((n, lv));
                     }
                 }
@@ -105,7 +106,7 @@ pub fn reachable(city: &City, year: u16) -> HashSet<Node> {
             _ => {}
         }
         for nd in next {
-            if seen.insert(nd) {
+            if allow(nd) && seen.insert(nd) {
                 q.push_back(nd);
             }
         }
