@@ -4,7 +4,7 @@
 //! ordinary player controller: no teleporting, no shortcuts through walls.
 
 use crate::game::{Game, Spot, SpotKind};
-use crate::player::{Input, Player, RADIUS};
+use crate::player::{Input, Player, HEIGHT, RADIUS};
 use crate::world::{Aabb, WalkWorld};
 use glam::Vec3;
 use std::cmp::Reverse;
@@ -69,16 +69,27 @@ pub fn route(w: &WalkWorld, city: &City, year: u16, from: Vec3, to: Vec3) -> Opt
         let Some(m) = dist.as_ref() else { return flat(p) };
         let k = ((p.x / CELL_M).floor() as i32, (p.z / CELL_M).floor() as i32, ((p.y + 0.1) / STOREY_M).floor() as i32);
         let d = *cache.borrow_mut().entry(k).or_insert_with(|| {
-            let steps = |n: kwc_sim::walk::Node| m.get(&n).map(|&d| d as f32 * CELL_M);
-            graph_node(city, year, p).and_then(steps).or_else(|| {
-                let n = nearby_node(city, year, p)?;
-                let c = Vec3::new((n.0 .0 as f32 + 0.5) * CELL_M, p.y, (n.0 .1 as f32 + 0.5) * CELL_M);
-                steps(n).map(|d| d + c.distance(p))
+            let steps = |q: Vec3| graph_node(city, year, q).and_then(|n| m.get(&n)).map(|&d| d as f32 * CELL_M);
+            // Off the graph, or on a bit of it the goal's walk never reached
+            // (a building's second landing, say): the best of the reached
+            // cells close by, plus the distance to them.
+            steps(p).or_else(|| {
+                (1..=4).find_map(|r: i32| {
+                    let ring = (-r..=r).flat_map(|di| (-r..=r).map(move |dj| (di, dj))).filter(|&(di, dj)| di.abs() == r || dj.abs() == r);
+                    ring.filter_map(|(di, dj)| {
+                        let q = p + Vec3::new(di as f32 * CELL_M, 0.0, dj as f32 * CELL_M);
+                        steps(q).map(|d| d + q.distance(p))
+                    })
+                    .min_by(|a, b| a.total_cmp(b))
+                })
             })
         });
         d.map_or(flat(p) * 2.0, |d| d.max(flat(p)))
     };
-    grid_route(w, from, to, FINE, &h, 600_000)
+    // The guide is right nearly always; when the graph and the buildings
+    // disagree badly enough that it isn't, search without it (slower, but on
+    // the planner's thread, so the courier only stops to think).
+    grid_route(w, from, to, FINE, &h, 600_000).or_else(|| grid_route(w, from, to, FINE, &flat, 3_000_000))
 }
 
 /// Why a route fails, stage by stage (for tests and debugging).
@@ -209,7 +220,10 @@ fn straight(w: &WalkWorld, a: Vec3, b: Vec3) -> bool {
         let t = i as f32 / n as f32;
         let (x, z) = (a.x + d.x * t, a.z + d.z * t);
         let Some(ny) = floor_at(w, x, z, y) else { return false };
-        if ny < y - 0.45 || !stands(w, Vec3::new(x, ny, z)) {
+        // A straight leg keeps a hand's width off walls and corners, so
+        // following it a little loosely never clips a door jamb.
+        let q = Aabb::new(Vec3::new(x - RADIUS - 0.08, ny + 0.02, z - RADIUS - 0.08), Vec3::new(x + RADIUS + 0.08, ny + HEIGHT, z + RADIUS + 0.08));
+        if ny < y - 0.45 || w.blocked(&q) {
             return false;
         }
         y = ny;
@@ -271,6 +285,11 @@ pub struct Autopilot {
     stuck: f32,
     tries: u32,
     pub status: String,
+    /// Where it had to give up on a route and find another (snags, for the
+    /// fairness soak).
+    pub stuck_at: Vec<Vec3>,
+    /// Stepping back from a snag before trying again (seconds left).
+    backoff: f32,
 }
 
 impl Autopilot {
@@ -345,12 +364,36 @@ impl Autopilot {
         } else {
             self.stuck += dt;
             if self.stuck > 2.5 {
+                self.stuck_at.push(p.pos);
                 self.status = "Finding another way".into();
+                self.stuck = 0.0;
+                self.backoff = 0.5;
+            }
+        }
+        if self.backoff > 0.0 {
+            // Step back and a little aside, then plan again from there.
+            self.backoff -= dt;
+            if self.backoff <= 0.0 {
                 self.plan(w, city, year, p.pos, t);
                 return idle;
             }
+            let side = if self.stuck_at.len() % 2 == 0 { 0.6 } else { -0.6 };
+            return (Input { forward: -0.7, strafe: side, ..Default::default() }, Act::Walk);
         }
-        let err = turn_to(p, (next.z - p.pos.z).atan2(next.x - p.pos.x), dt);
+        // Follow the line of the path, not just its next point: aim a little
+        // way ahead of where we are along the current leg, so drifting off it
+        // on a turn is corrected before it clips a corner.
+        let prev = if self.k > 0 { self.path[self.k - 1] } else { p.pos };
+        let leg = Vec3::new(next.x - prev.x, 0.0, next.z - prev.z);
+        let aim = if leg.length() > 0.2 {
+            let dir = leg / leg.length();
+            let along = Vec3::new(p.pos.x - prev.x, 0.0, p.pos.z - prev.z).dot(dir).clamp(0.0, leg.length());
+            let ahead = (along + 0.7).min(leg.length());
+            prev + dir * ahead
+        } else {
+            next
+        };
+        let err = turn_to(p, (aim.z - p.pos.z).atan2(aim.x - p.pos.x), dt);
         // Look where you're going: up and down the stairs too.
         let ahead = self.path[(self.k + 1).min(self.path.len() - 1)];
         let rise = (ahead.y - p.pos.y) / flat(p.pos, ahead).max(1.0);

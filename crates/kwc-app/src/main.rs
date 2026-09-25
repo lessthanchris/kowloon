@@ -1710,6 +1710,64 @@ mod tests {
         assert_ne!(jobs("KWC-1965-7F3A"), jobs("KWC-1965-0042"));
     }
 
+    /// The fairness soak: the autopilot does rounds on many seeds and eras
+    /// and reports every job it had to give up and every place it snagged.
+    /// Slow; run with `cargo test --release -p kwc-app soak -- --ignored --nocapture`.
+    #[test]
+    #[ignore]
+    fn soak() {
+        let seeds: Vec<u64> = std::env::var("SOAK_SEEDS").ok().map_or(vec![1987, 17, 5488, 10959, 16430, 21901], |s| s.split(',').filter_map(|x| x.parse().ok()).collect());
+        let (mut all_lost, mut all_stuck, mut all_done) = (0, 0, 0);
+        for seed in seeds {
+            let city = Arc::new(generate(&Params { seed, ..Default::default() }));
+            let soc = kwc_sim::society::generate(&city);
+            for year in [1950u16, 1960, 1970, 1987] {
+                let w = Arc::new(world::build(&city, year).0);
+                let spots = game::spots(&city, &soc, year);
+                let mut g = game::Game::new(seed, year);
+                let mut p = player::Player::new(w.spawn, w.spawn_yaw);
+                let mut ap = autopilot::Autopilot::default();
+                let (mut t, mut lost) = (0.0f32, 0);
+                while g.delivered < 4 && t < 1200.0 {
+                    if g.job.is_none() {
+                        g.new_job(&city, &soc);
+                    }
+                    let planning = ap.planning();
+                    let (input, act) = ap.drive(&w, &city, year, &mut p, autopilot::target(&g, &spots), if planning { 0.0 } else { TICK });
+                    if planning {
+                        std::thread::sleep(std::time::Duration::from_millis(1));
+                    } else {
+                        p.update(&w, input, TICK);
+                        t += TICK;
+                    }
+                    match act {
+                        autopilot::Act::Knock => {
+                            g.interact(&city, &soc, &spots, p.pos);
+                        }
+                        autopilot::Act::Lost => {
+                            lost += 1;
+                            if let Some(tg) = autopilot::target(&g, &spots) {
+                                eprintln!("    LOST seed {seed} {year}: from {:?} to {:?} :: {}", p.pos, tg.stand, autopilot::explain(&w, &city, year, p.pos, tg.stand));
+                            }
+                            g.job = None;
+                        }
+                        autopilot::Act::Walk => {}
+                    }
+                }
+                for s in &ap.stuck_at {
+                    let c = ((s.x / CELL_M) as u16, (s.z / CELL_M) as u16);
+                    let what = if (c.0 as usize) < city.w && (c.1 as usize) < city.d { format!("{:?}/{:?}", city.ground_at(c), city.role_at(c)) } else { "outside".into() };
+                    eprintln!("    snag seed {seed} {year} at {s:?} cell {c:?} {what}");
+                }
+                eprintln!("seed {seed} {year}: {} delivered in {t:.0} s, {lost} lost, {} snags", g.delivered, ap.stuck_at.len());
+                all_lost += lost;
+                all_stuck += ap.stuck_at.len();
+                all_done += g.delivered;
+            }
+        }
+        eprintln!("TOTAL: {all_done} delivered, {all_lost} lost, {all_stuck} snags");
+    }
+
     /// A save from inside what is now a hut gets you out, not stuck.
     #[test]
     fn unstick_from_solid() {
