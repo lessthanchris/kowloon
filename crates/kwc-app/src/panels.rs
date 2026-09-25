@@ -17,6 +17,19 @@ fn family_ink(k: usize) -> Color32 {
 }
 
 /// Your notebook map: only what you've walked near this era.
+/// A landmark on the map: a ringed dot and its name in bold.
+fn pin(painter: &egui::Painter, p: Pos2, col: Color32, label: &str) {
+    painter.circle_filled(p, 6.5, Color32::WHITE);
+    painter.circle_filled(p, 5.0, col);
+    let font = FontId::proportional(13.0);
+    let at = p + egui::vec2(9.0, 0.0);
+    // A pale halo behind the name so it reads over the lanes.
+    for (dx, dy) in [(-1.0, 0.0), (1.0, 0.0), (0.0, -1.0), (0.0, 1.0)] {
+        painter.text(at + egui::vec2(dx, dy), Align2::LEFT_CENTER, label, font.clone(), PAPER);
+    }
+    painter.text(at, Align2::LEFT_CENTER, label, font, col);
+}
+
 pub fn notebook(ui: &mut egui::Ui, city: &City, soc: &Society, g: &Game, feet: Vec3, yaw: f32) {
     let screen = ui.max_rect();
     let painter = ui.ctx().layer_painter(egui::LayerId::new(egui::Order::Foreground, egui::Id::new("notebook")));
@@ -70,8 +83,19 @@ pub fn notebook(ui: &mut egui::Ui, city: &City, soc: &Society, g: &Game, feet: V
             FeatureKind::Lift => continue,
         };
         let p = at(f.cell).center();
-        painter.circle_filled(p, 3.5, col);
-        painter.text(p + egui::vec2(5.0, -2.0), Align2::LEFT_BOTTOM, label, FontId::proportional(10.0), col);
+        if f.kind == FeatureKind::WaterStandpipe {
+            painter.circle_filled(p, 3.0, col);
+            continue;
+        }
+        pin(&painter, p, col, label);
+    }
+    // The Yamen, once you've seen any of it.
+    let yamen: Vec<Cell> = g.seen.iter().copied().filter(|&c| city.ground_at(c) == Ground::Yamen).collect();
+    if !yamen.is_empty() {
+        let all: Vec<Cell> = (0..city.w * city.d).filter(|&k| city.ground[k] == Ground::Yamen).map(|k| ((k % city.w) as u16, (k / city.w) as u16)).collect();
+        let (sx, sy) = all.iter().fold((0.0, 0.0), |a, c| (a.0 + c.0 as f32, a.1 + c.1 as f32));
+        let mid = (((sx / all.len() as f32) as u16), ((sy / all.len() as f32) as u16));
+        pin(&painter, at(mid).center(), Color32::from_rgb(140, 60, 40), "Yamen");
     }
     // Job doors, if you've been near them.
     if let Some(j) = &g.job {

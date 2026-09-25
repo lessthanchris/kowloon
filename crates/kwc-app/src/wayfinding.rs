@@ -58,6 +58,15 @@ pub fn tour(city: &City, year: u16, start: Vec3) -> Vec<Stop> {
             let at = |c: Cell| Vec3::new((c.0 as f32 + 0.5) * C, 0.0, (c.1 as f32 + 0.5) * C);
             // Stand in the open cell closest to the landmark's middle, facing it.
             let mid = anchor(city, &name).unwrap_or_else(|| cells.iter().map(|&c| at(c)).sum::<Vec3>() / cells.len() as f32);
+            // The Yamen is met at its gateway, under its name board and lanterns.
+            if name == "Yamen" {
+                if let Some((g, d)) = crate::lights::yamen_gate(city) {
+                    if let Some(front) = city.step(g, d).filter(|&f| open(city, year, f)) {
+                        let facing = Vec3::new(at(g).x - at(front).x, 0.0, at(g).z - at(front).z).normalize_or(Vec3::X);
+                        return Some(Stop { about: about(&name), name, stand: at(front), facing });
+                    }
+                }
+            }
             let c = *cells.iter().filter(|&&c| open(city, year, c)).min_by(|a, b| at(**a).distance(mid).total_cmp(&at(**b).distance(mid)))?;
             let facing = Vec3::new(mid.x - at(c).x, 0.0, mid.z - at(c).z).normalize_or(Vec3::X);
             Some(Stop { about: about(&name), name, stand: at(c), facing })
@@ -73,6 +82,11 @@ pub fn tour(city: &City, year: u16, start: Vec3) -> Vec<Stop> {
         out.push(s);
     }
     out
+}
+
+/// Every landmark and where it is: for light pools, name boards and the notebook.
+pub fn landmark_points(city: &City) -> Vec<(String, Vec3)> {
+    landmarks(city).into_iter().filter_map(|(name, _)| anchor(city, &name).map(|p| (name, p))).collect()
 }
 
 /// Where a landmark itself is (not the lane beside it).

@@ -1480,6 +1480,20 @@ fn screenshot(args: &[String], out: &str) {
             }
             println!("plot {} height {h} floor {f}", plot.id);
         }
+        // `--landmark N`: stand a few steps back from tour stop N, looking at it.
+        if let Some(k) = arg::<usize>(args, "--landmark") {
+            let stops = wayfinding::tour(&world.city, year, wk.world.spawn);
+            if let Some(st) = stops.get(k.min(stops.len().saturating_sub(1))) {
+                p.pos = [3.5f32, 3.0, 2.5, 2.0, 1.5, 1.0, 0.5]
+                    .into_iter()
+                    .map(|d| st.stand - st.facing * d)
+                    .find(|&q| !wk.world.blocked(&player::Player::aabb_at(q)) && game::line_clear(&wk.world, q + Vec3::Y * 1.6, st.stand + Vec3::Y * 1.6))
+                    .unwrap_or(st.stand);
+                p.yaw = st.facing.z.atan2(st.facing.x);
+                p.pitch = 0.22;
+                println!("landmark {}: {}", k, st.name);
+            }
+        }
         if let Some(v) = arg::<String>(args, "--at").map(|v| floats(&v)) {
             if v.len() >= 3 {
                 p.pos = Vec3::new(v[0], v[1], v[2]);

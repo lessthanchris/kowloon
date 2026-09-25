@@ -386,6 +386,9 @@ pub fn plates(city: &City, soc: &Society, year: u16) -> Vec<Plate> {
     for sp in crate::wayfinding::signposts(city, year) {
         out.push(Plate { centre: sp.centre, right: sp.right, lines: sp.lines, line_h: 0.11, max_w: 1.22, colour: [240, 236, 220], kind: SpotKind::Sign });
     }
+    for (centre, right, text, h) in crate::lights::landmark_names(city) {
+        out.push(Plate { centre, right, lines: vec![text], line_h: h, max_w: 1.4, colour: [255, 214, 120], kind: SpotKind::Sign });
+    }
     for (centre, right, text) in crate::wayfinding::floor_marks(city, year) {
         out.push(Plate { centre, right, lines: vec![text], line_h: 0.22, max_w: 0.9, colour: [235, 200, 90], kind: SpotKind::Sign });
     }

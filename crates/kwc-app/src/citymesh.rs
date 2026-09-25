@@ -318,6 +318,10 @@ pub fn build(city: &City, year: u16, mode: ColourMode) -> MeshData {
         m.ao = sky.ao(centre(&fx.aabb), None);
         m.cuboid(fx.aabb.min, fx.aabb.max, fx.col, fx.emit, Faces::ALL);
     }
+    for (b, col, px, nx, pz, nz) in crate::lights::paving(city) {
+        m.ao = sky.ao(centre(&b), None);
+        m.cuboid(b.min, b.max, col, 0.0, Faces { top: true, bottom: false, px, nx, pz, nz });
+    }
     let (mut pieces, _) = crate::world::roof_furniture(city, year);
     pieces.extend(crate::world::squatters(city, year));
     pieces.extend(crate::world::surroundings(city, year));

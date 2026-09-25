@@ -188,6 +188,12 @@ pub fn landmarks(city: &City) -> Vec<Fixture> {
                 }
                 out.push(Fixture { aabb: Aabb::new(Vec3::new(x0 - 0.2, 3.3, z0 - 0.2), Vec3::new(x0 + C + 0.2, 3.8, z0 + C + 0.2)), col: stone, emit: 0.0 });
                 out.push(Fixture { aabb: Aabb::new(Vec3::new(cx - 0.5, 3.35, z0 - 0.25), Vec3::new(cx + 0.5, 3.75, z0 + C + 0.25)), col: srgb(120, 30, 25), emit: -0.1 });
+                // Small red lanterns hung off both faces of the lintel, framing the gate.
+                for (za, zb) in [(z0 - 0.52, z0 - 0.24), (z0 + C + 0.24, z0 + C + 0.52)] {
+                    for xa in [x0 + 0.02, x0 + C - 0.3] {
+                        out.push(Fixture { aabb: Aabb::new(Vec3::new(xa, 2.85, za), Vec3::new(xa + 0.28, 3.25, zb)), col: srgb(230, 60, 40), emit: -1.6 });
+                    }
+                }
             }
             FeatureKind::WaterStandpipe => {
                 out.push(Fixture { aabb: Aabb::new(Vec3::new(cx - 0.05, 0.0, cz - 0.05), Vec3::new(cx + 0.05, 1.1, cz + 0.05)), col: srgb(70, 90, 80), emit: 0.0 });
@@ -210,8 +216,27 @@ pub fn landmarks(city: &City) -> Vec<Fixture> {
                 out.push(Fixture { aabb: Aabb::new(Vec3::new(cx - r, h, cz - 0.04), Vec3::new(cx - r + 0.08, 2.0, cz + 0.04)), col: srgb(110, 80, 50), emit: 0.0 });
                 out.push(Fixture { aabb: Aabb::new(Vec3::new(cx + r - 0.08, h, cz - 0.04), Vec3::new(cx + r, 2.0, cz + 0.04)), col: srgb(110, 80, 50), emit: 0.0 });
                 out.push(Fixture { aabb: Aabb::new(Vec3::new(cx - r, 1.95, cz - 0.04), Vec3::new(cx + r, 2.03, cz + 0.04)), col: srgb(110, 80, 50), emit: 0.0 });
+                // Its name, on a board hung from the beam.
+                out.push(Fixture { aabb: Aabb::new(Vec3::new(cx - 0.45, 1.5, cz - 0.03), Vec3::new(cx + 0.45, 1.88, cz + 0.03)), col: srgb(40, 60, 70), emit: 0.0 });
             }
             _ => {}
+        }
+    }
+    // The Yamen's gateway: a name board over it, a red lantern either side.
+    if let Some((c, d)) = yamen_gate(city) {
+        let (dx, dz) = d.delta();
+        let n = Vec3::new(dx as f32, 0.0, dz as f32);
+        let side = Vec3::new(-n.z, 0.0, n.x);
+        let face = Vec3::new((c.0 as f32 + 0.5) * C, 0.0, (c.1 as f32 + 0.5) * C) + n * (C * 0.5);
+        let b = |centre: Vec3, half_side: f32, y0: f32, y1: f32, depth: f32| {
+            let a = centre - side * half_side + Vec3::Y * y0;
+            let z = centre + side * half_side + Vec3::Y * y1 + n * depth;
+            Aabb::new(a.min(z), a.max(z))
+        };
+        out.push(Fixture { aabb: b(face, 0.8, 3.0, 3.45, 0.05), col: srgb(40, 32, 26), emit: 0.0 });
+        for s in [-1.0f32, 1.0] {
+            let at = face + side * (s * 0.9) + n * 0.3;
+            out.push(Fixture { aabb: b(at, 0.16, 2.3, 2.75, 0.3) , col: srgb(230, 60, 40), emit: -1.6 });
         }
     }
     // Two old trees in the Yamen's front courtyard.
@@ -227,6 +252,95 @@ pub fn landmarks(city: &City) -> Vec<Fixture> {
             out.push(Fixture { aabb: Aabb::new(Vec3::new(cx - 1.6, 3.0, cz - 1.6), Vec3::new(cx + 1.6, 5.8, cz + 1.6)), col: srgb(50, 100, 50), emit: 0.0 });
             out.push(Fixture { aabb: Aabb::new(Vec3::new(cx - 1.1, 5.8, cz - 1.1), Vec3::new(cx + 1.1, 6.8, cz + 1.1)), col: srgb(60, 115, 55), emit: 0.0 });
         }
+    }
+    out
+}
+
+/// The Yamen's gateway: the courtyard cell that opens onto the lane,
+/// southernmost, and the way out.
+pub fn yamen_gate(city: &City) -> Option<(Cell, Dir)> {
+    (0..city.w * city.d)
+        .filter(|&k| city.ground[k] == Ground::Yamen)
+        .map(|k| ((k % city.w) as u16, (k / city.w) as u16))
+        .filter(|&c| crate::citymesh::yamen_part(city, c) == crate::citymesh::YamenPart::Yard)
+        .filter_map(|c| city.neighbours(c).find(|(_, n)| city.ground_at(*n) == Ground::Alley).map(|(d, _)| (c, d)))
+        .max_by_key(|(c, _)| (c.1, c.0))
+}
+
+/// The landmarks' names on their boards: text centre, reading direction, words, letter height.
+pub fn landmark_names(city: &City) -> Vec<(Vec3, Vec3, String, f32)> {
+    let right_of = |n: Vec3| (-n).cross(Vec3::Y);
+    let mut out = vec![];
+    for f in &city.features {
+        let (x0, z0) = (f.cell.0 as f32 * C, f.cell.1 as f32 * C);
+        let (cx, cz) = (x0 + C / 2.0, z0 + C / 2.0);
+        match f.kind {
+            FeatureKind::SouthGate => {
+                for (z, n) in [(z0 - 0.256, -Vec3::Z), (z0 + C + 0.256, Vec3::Z)] {
+                    out.push((Vec3::new(cx, 3.55, z), right_of(n), "SOUTH GATE".to_string(), 0.17));
+                }
+            }
+            FeatureKind::NaturalWell => {
+                for (z, n) in [(cz - 0.036, -Vec3::Z), (cz + 0.036, Vec3::Z)] {
+                    out.push((Vec3::new(cx, 1.69, z), right_of(n), f.name.clone().unwrap_or("BIG WELL".into()).to_uppercase(), 0.14));
+                }
+            }
+            _ => {}
+        }
+    }
+    if let Some((c, d)) = yamen_gate(city) {
+        let (dx, dz) = d.delta();
+        let n = Vec3::new(dx as f32, 0.0, dz as f32);
+        let face = Vec3::new((c.0 as f32 + 0.5) * C, 0.0, (c.1 as f32 + 0.5) * C) + n * (C * 0.5 + 0.056);
+        out.push((face + Vec3::Y * 3.225, right_of(n), "YAMEN".to_string(), 0.28));
+    }
+    out
+}
+
+/// Pale granite paving round each landmark (street level, open lane only),
+/// so even by day you can tell you've arrived.
+pub fn paving(city: &City) -> Vec<(Aabb, [f32; 3], bool, bool, bool, bool)> {
+    let mut cells: std::collections::HashSet<Cell> = Default::default();
+    let mut around = |c: Cell, r: i32| {
+        for dj in -r..=r {
+            for di in -r..=r {
+                let n = (c.0 as i32 + di, c.1 as i32 + dj);
+                if n.0 >= 0 && n.1 >= 0 && (n.0 as usize) < city.w && (n.1 as usize) < city.d {
+                    let n = (n.0 as u16, n.1 as u16);
+                    if city.ground_at(n) == Ground::Alley {
+                        cells.insert(n);
+                    }
+                }
+            }
+        }
+    };
+    for f in &city.features {
+        match f.kind {
+            FeatureKind::SouthGate | FeatureKind::NaturalWell => around(f.cell, 1),
+            FeatureKind::Temple => {
+                if let Some(u) = city.units.iter().find(|u| u.usage == UnitUse::Temple && Some(u.plot) == f.plot) {
+                    if let Some(front) = city.step(u.door.cell, u.door.facing) {
+                        around(front, 1);
+                    }
+                }
+            }
+            _ => {}
+        }
+    }
+    if let Some((c, d)) = yamen_gate(city) {
+        if let Some(front) = city.step(c, d) {
+            around(front, 1);
+        }
+    }
+    let mut out = vec![];
+    for &c in &cells {
+        let (x0, z0) = (c.0 as f32 * C, c.1 as f32 * C);
+        let k = 0.9 + 0.15 * crate::citymesh::hash(c.0 as u32, c.1 as u32, 77);
+        let col = srgb(178, 172, 158);
+        let col = [col[0] * k, col[1] * k, col[2] * k];
+        // Sides only where the paving stops (no hidden faces between flags).
+        let edge = |d: Dir| city.step(c, d).is_none_or(|n| !cells.contains(&n));
+        out.push((Aabb::new(Vec3::new(x0, 0.0, z0), Vec3::new(x0 + C, 0.03, z0 + C)), col, edge(Dir::E), edge(Dir::W), edge(Dir::S), edge(Dir::N)));
     }
     out
 }
@@ -428,6 +542,20 @@ pub fn collect(city: &City, year: u16) -> Vec<PointLight> {
         let warm = hash(u.id, 3, 3) < 0.5;
         let col = if warm { lin(srgb(255, 200, 140)) } else { lin(srgb(210, 255, 225)) };
         lights.push(PointLight { pos, col: col * if shop { 1.2 } else { 0.6 }, range: if shop { 4.5 } else { 2.5 } });
+    }
+    // Each landmark lights its own pool, in its own colour, so it can be
+    // picked out down a dark lane.
+    for (name, at) in crate::wayfinding::landmark_points(city) {
+        let col = if name.contains("Gate") {
+            srgb(255, 150, 90)
+        } else if name.contains("Well") {
+            srgb(140, 215, 255)
+        } else if name.contains("Yamen") {
+            srgb(255, 225, 180)
+        } else {
+            srgb(255, 190, 80)
+        };
+        lights.push(PointLight { pos: at + Vec3::Y * 2.6, col: lin(col) * 1.15, range: 9.0 });
     }
     // Lamps and lit signs.
     for fx in fixtures(city, year) {
