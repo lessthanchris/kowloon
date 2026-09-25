@@ -37,6 +37,8 @@ struct Settings {
     night: bool,
     torch: bool,
     want_walk: bool,
+    /// The how-to card (H).
+    help: bool,
 }
 
 struct World {
@@ -176,6 +178,7 @@ impl ApplicationHandler for App {
                             KeyCode::KeyT => self.settings.torch = !self.settings.torch,
                             KeyCode::KeyN => self.settings.night = !self.settings.night,
                             KeyCode::KeyE if walking => self.interact(),
+                            KeyCode::KeyH => self.settings.help = !self.settings.help,
                             _ => {}
                         }
                     }
@@ -226,6 +229,9 @@ impl App {
     fn interact(&mut self) {
         let (Some(g), Some(w)) = (self.game.as_mut(), self.walk.as_ref()) else { return };
         g.interact(&self.world.city, &self.world.society, &w.spots, w.player.pos);
+        if g.delivered > 0 {
+            self.settings.help = false;
+        }
     }
 
     fn enter_walk(&mut self) {
@@ -348,6 +354,9 @@ struct HudInfo {
     /// Addresses for the job card.
     from_addr: String,
     to_addr: String,
+    /// Pointer to the current target: screen angle (0 = straight ahead,
+    /// clockwise) and a hint ("24 m · up to 3/F").
+    arrow: Option<(f32, String)>,
 }
 
 /// Work out what the HUD shows this frame: where you are, and the names of
@@ -400,7 +409,32 @@ fn hud_info(wd: &World, w: &Walk, g: Option<&game::Game>, params: &FrameParams) 
     }
     let addr = |u: u32| soc.directory.address[u as usize].line();
     let (from_addr, to_addr) = g.and_then(|g| g.job.as_ref()).map_or((String::new(), String::new()), |j| (addr(j.from), addr(j.to)));
-    HudInfo { place: game::place_name(city, soc, year, w.player.pos), labels, from_addr, to_addr }
+    // The arrow: which way, how far, and which floor.
+    let arrow = g.and_then(|g| g.job.as_ref()).and_then(|j| {
+        let unit = if j.picked { j.to } else { j.from };
+        let spot = w.spots.iter().find(|sp| sp.kind == game::SpotKind::Unit(unit))?;
+        let p = &w.player;
+        let d = spot.stand - p.pos;
+        let fwd = Vec3::new(p.yaw.cos(), 0.0, p.yaw.sin());
+        let right = Vec3::new(-fwd.z, 0.0, fwd.x);
+        let angle = d.dot(right).atan2(d.dot(fwd));
+        let dist = Vec3::new(d.x, 0.0, d.z).length();
+        let want = city.units[unit as usize].floor as i32;
+        let here = if p.pos.y < 0.5 { 0 } else { (p.pos.y / world::S + 0.25).floor() as i32 };
+        let floor = address::Address::floor_name(want as u8);
+        let vertical = if want > here {
+            format!(" · up to {floor}")
+        } else if want < here {
+            format!(" · down to {floor}")
+        } else if want > 0 {
+            format!(" · on {floor}")
+        } else {
+            String::new()
+        };
+        let what = if j.picked { "Deliver" } else { "Collect" };
+        Some((angle, format!("{what} · {dist:.0} m{vertical}")))
+    });
+    HudInfo { place: game::place_name(city, soc, year, w.player.pos), labels, from_addr, to_addr, arrow }
 }
 
 fn hud(ui: &mut egui::Ui, w: &Walk, s: &Settings, g: Option<&game::Game>, info: &HudInfo, fps: f32) {
@@ -452,6 +486,40 @@ fn hud(ui: &mut egui::Ui, w: &Walk, s: &Settings, g: Option<&game::Game>, info: 
     // Crosshair.
     painter.circle_filled(screen.center(), 2.0, Color32::from_white_alpha(140));
 
+    // Arrow to the current target.
+    if let Some((angle, hint)) = &info.arrow {
+        let c = Pos2::new(screen.center().x, screen.top() + 70.0);
+        let colour = if hint.starts_with("Deliver") { Color32::from_rgb(255, 200, 90) } else { Color32::from_rgb(120, 230, 150) };
+        let (sn, cs) = angle.sin_cos();
+        let rot = |x: f32, y: f32| Pos2::new(c.x + x * cs - y * sn, c.y + x * sn + y * cs);
+        painter.circle_filled(c, 24.0, Color32::from_black_alpha(140));
+        let pts = vec![rot(0.0, -18.0), rot(11.0, 11.0), rot(0.0, 4.0), rot(-11.0, 11.0)];
+        painter.add(egui::Shape::convex_polygon(vec![pts[0], pts[1], pts[2]], colour, Stroke::NONE));
+        painter.add(egui::Shape::convex_polygon(vec![pts[0], pts[2], pts[3]], colour, Stroke::NONE));
+        painter.text(Pos2::new(c.x, c.y + 38.0), Align2::CENTER_CENTER, hint, FontId::proportional(15.0), colour);
+    }
+
+    // How to play.
+    if s.help {
+        egui::Area::new(egui::Id::new("help")).anchor(Align2::CENTER_CENTER, [0.0, 40.0]).show(ui.ctx(), |ui| {
+            egui::Frame::new().fill(Color32::from_rgba_unmultiplied(20, 18, 16, 235)).inner_margin(18.0).corner_radius(6.0).show(ui, |ui| {
+                ui.set_max_width(460.0);
+                ui.colored_label(paper, egui::RichText::new("Delivering in the Walled City").size(20.0).strong());
+                ui.add_space(6.0);
+                let line = |ui: &mut egui::Ui, t: &str| {
+                    ui.colored_label(Color32::from_rgb(215, 208, 190), t);
+                };
+                line(ui, "1. Your job is top right: collect something, then deliver it.");
+                line(ui, "2. Follow the arrow at the top of the screen. It points at the door you want, and tells you the distance and the floor.");
+                line(ui, "3. Names float over doors as you pass. Your pick-up glows green, your drop-off amber.");
+                line(ui, "4. Flats are upstairs: go in at the building's street door and take the stairs. \"Flat 3B\" is door B on 3/F; G/F is the ground floor.");
+                line(ui, "5. Stand right in front of the door and press E.");
+                ui.add_space(6.0);
+                ui.colored_label(Color32::from_white_alpha(140), "Mouse look · WASD walk · Shift run · Space jump · T torch · N night · Tab city view · H hide this");
+            });
+        });
+    }
+
     // The job card.
     if let Some(g) = g {
         egui::Area::new(egui::Id::new("job")).anchor(Align2::RIGHT_TOP, [-16.0, 16.0]).show(ui.ctx(), |ui| {
@@ -493,7 +561,7 @@ fn hud(ui: &mut egui::Ui, w: &Walk, s: &Settings, g: Option<&game::Game>, info: 
         ui.colored_label(
             Color32::from_white_alpha(110),
             egui::RichText::new(format!(
-                "WASD walk · Shift run · E knock · W on a ladder to climb · T torch ({}) · N night · Tab overview · {fps:.0} fps",
+                "WASD walk · Shift run · E knock · W on a ladder to climb · T torch ({}) · N night · H help · Tab overview · {fps:.0} fps",
                 if s.torch { "on" } else { "off" }
             ))
             .small(),
@@ -664,6 +732,7 @@ fn main() {
             night: false,
             torch: true,
             want_walk: walk_now,
+            help: true,
         },
         orbit,
         walk: None,
