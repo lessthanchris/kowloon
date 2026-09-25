@@ -60,7 +60,7 @@ pub fn grow(city: &mut City) {
         .collect();
     let near_gate: Vec<f32> = (0..n)
         .map(|p| {
-            let c = city.plots[p].core;
+            let c = city.plots[p].core[0];
             let g = city.south_gate;
             let d = ((c.0 as f32 - g.0 as f32).powi(2) + (c.1 as f32 - g.1 as f32).powi(2)).sqrt();
             1.0 / (1.0 + d / 15.0)
@@ -68,7 +68,7 @@ pub fn grow(city: &mut City) {
         .collect();
 
     for p in &mut city.plots {
-        p.ambition = if rng.gen::<f32>() < 0.55 { MAX_FLOORS as u8 } else { rng.gen_range(9..=13) };
+        p.ambition = if rng.gen::<f32>() < 0.55 { MAX_FLOORS as u8 } else { rng.gen_range(10..=13) };
     }
 
     let mut heights = vec![0u8; n];
@@ -83,7 +83,7 @@ pub fn grow(city: &mut City) {
                     continue;
                 }
                 let built_nb = neigh[p].iter().filter(|&&q| heights[q] > 0).count() as f32;
-                let s = built_nb * 1.5 + near_gate[p] * 3.0 + if frontage[p] { 1.0 } else { 0.0 } + rng.gen::<f32>() * 4.0;
+                let s = built_nb * 0.5 + near_gate[p] * 1.0 + if frontage[p] { 1.0 } else { 0.0 } + rng.gen::<f32>() * 6.0;
                 if s > best.0 {
                     best = (s, p);
                 }

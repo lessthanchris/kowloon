@@ -49,11 +49,32 @@ impl Dir {
     }
 }
 
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub enum FeatureKind {
+    /// One of the eight municipal water pipes that supplied the whole city.
+    WaterStandpipe,
+    /// The last natural ground well, off Tai Chang ("Big Well") Street.
+    NaturalWell,
+    /// One of only two lifts in the city.
+    Lift,
+    Temple,
+    SouthGate,
+}
+
+#[derive(Clone, Debug, Serialize, Deserialize)]
+pub struct Feature {
+    pub kind: FeatureKind,
+    pub cell: Cell,
+    pub name: Option<String>,
+    pub plot: Option<u32>,
+}
+
 #[derive(Clone, Debug, Serialize, Deserialize)]
 pub struct Plot {
     pub id: u32,
     pub cells: Vec<Cell>,
-    pub core: Cell,
+    /// Stair core cells; `core[0]` opens onto a lane at ground level.
+    pub core: Vec<Cell>,
     /// Year the plot was first built on (0 = never).
     pub founded: u16,
     /// Year of the last wholesale rebuild (0 = original structure).
@@ -108,6 +129,8 @@ pub struct Unit {
     pub door: Door,
     pub usage: UnitUse,
     pub door_state: DoorState,
+    /// Proper name, for the few places that had one (temples).
+    pub name: Option<String>,
 }
 
 /// A walkway joining two buildings' circulation at the same floor. `span` holds the
@@ -140,9 +163,11 @@ pub struct City {
     pub units: Vec<Unit>,
     pub bridges: Vec<Bridge>,
     pub lanes: Vec<Lane>,
+    pub features: Vec<Feature>,
     pub south_gate: Cell,
     /// Footprint in plan metres (x east, y south), for drawing the map.
     pub ring_m: Vec<(f32, f32)>,
+    pub yamen_m: Vec<(f32, f32)>,
 }
 
 impl City {

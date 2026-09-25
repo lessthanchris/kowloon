@@ -1,24 +1,23 @@
-//! Ground plan: footprint raster, the Yamen, the alley network, plots, and each
+//! Ground plan: footprint raster, the Yamen, the lane network, plots, and each
 //! plot's stair core + corridors.
+//!
+//! Grounding (RESEARCH.md): lanes "often only 1–2 m" wide; "no real entrances,
+//! just narrow openings between shops"; Lung Chun Back Road one of the few lanes
+//! running east–west across the city; Sai Shing ("West City") Road on the west;
+//! Lo Yan Street entered from Tung Tau Tsuen Road on the north side.
 
 use crate::city::*;
-use crate::site::{Site, CELL_M, MAX_FLOORS};
+use crate::site::{point_in, Site, CELL_M, MAX_FLOORS};
 use crate::{rng_for, Params};
 use rand::seq::SliceRandom;
 use rand::Rng;
 use std::cmp::Reverse;
-use std::collections::{BinaryHeap, VecDeque};
+use std::collections::{BinaryHeap, HashMap, VecDeque};
 
-const LANE_NAMES: &[&str] = &[
-    "Lung Chun Road",
-    "Tai Chang Street",
-    "Lo Yan Street",
-    "Kwong Ming Street",
-    "Sai Shing Road",
-    "Tung Tsing Road",
-    "Lung Shing Road",
-    "Tin Hau Temple Lane",
-];
+/// Minimum plot size in cells (~27 m²); smaller leftovers merge or become wells.
+const MIN_PLOT: usize = 12;
+/// How far (cells, through rooms) a room may sit from a corridor or stair.
+const ROOM_REACH: u32 = 4;
 
 pub fn build(params: &Params) -> City {
     let site = Site::load();
@@ -35,32 +34,59 @@ pub fn build(params: &Params) -> City {
         units: vec![],
         bridges: vec![],
         lanes: vec![],
+        features: vec![],
         south_gate: (0, 0),
         ring_m: site.ring_m.clone(),
+        yamen_m: site.yamen_m.clone(),
     };
 
     // Raster: a cell is inside if its centre is.
     for j in 0..d {
         for i in 0..w {
-            let (x, y) = ((i as f32 + 0.5) * CELL_M, (j as f32 + 0.5) * CELL_M);
+            let (x, y) = centre((i as u16, j as u16));
             if site.contains(x, y) {
-                city.ground[j * w + i] = Ground::Plot;
+                city.ground[j * w + i] = if point_in(&site.yamen_m, x, y) { Ground::Yamen } else { Ground::Plot };
+            }
+        }
+    }
+    // Keep a lane around the Yamen compound so it stays reachable.
+    let yamen: Vec<Cell> = all_cells(&city).into_iter().filter(|&c| city.ground_at(c) == Ground::Yamen).collect();
+    for c in yamen {
+        for n in ring8(&city, c) {
+            let k = city.idx(n);
+            if city.ground[k] == Ground::Plot {
+                city.ground[k] = Ground::Alley;
             }
         }
     }
 
-    place_yamen(&mut city);
-    city.south_gate = nearest_inside(&city, site.south_gate_m);
-    carve_alleys(&mut city);
+    city.south_gate = nearest(&city, site.south_gate_m, |c| city.ground_at(c) == Ground::Plot && is_perimeter(&city, c));
+    city.features.push(Feature { kind: FeatureKind::SouthGate, cell: city.south_gate, name: Some("South Gate".into()), plot: None });
+    carve_lanes(&mut city);
     make_plots(&mut city);
     city
 }
 
-fn inside_cells(city: &City) -> Vec<Cell> {
+pub fn centre(c: Cell) -> (f32, f32) {
+    ((c.0 as f32 + 0.5) * CELL_M, (c.1 as f32 + 0.5) * CELL_M)
+}
+
+fn all_cells(city: &City) -> Vec<Cell> {
+    let mut v = Vec::with_capacity(city.w * city.d);
+    for j in 0..city.d as u16 {
+        for i in 0..city.w as u16 {
+            v.push((i, j));
+        }
+    }
+    v
+}
+
+fn ring8(city: &City, c: Cell) -> Vec<Cell> {
     let mut v = vec![];
-    for j in 0..city.d {
-        for i in 0..city.w {
-            if city.ground[j * city.w + i] != Ground::Outside {
+    for dj in -1..=1 {
+        for di in -1..=1 {
+            let (i, j) = (c.0 as i32 + di, c.1 as i32 + dj);
+            if (di, dj) != (0, 0) && city.in_bounds(i, j) {
                 v.push((i as u16, j as u16));
             }
         }
@@ -68,93 +94,25 @@ fn inside_cells(city: &City) -> Vec<Cell> {
     v
 }
 
-fn nearest_inside(city: &City, (x, y): (f32, f32)) -> Cell {
-    *inside_cells(city)
-        .iter()
-        .min_by(|a, b| {
-            let da = ((a.0 as f32 + 0.5) * CELL_M - x).powi(2) + ((a.1 as f32 + 0.5) * CELL_M - y).powi(2);
-            let db = ((b.0 as f32 + 0.5) * CELL_M - x).powi(2) + ((b.1 as f32 + 0.5) * CELL_M - y).powi(2);
-            da.total_cmp(&db)
+fn nearest(city: &City, (x, y): (f32, f32), ok: impl Fn(Cell) -> bool) -> Cell {
+    all_cells(city)
+        .into_iter()
+        .filter(|&c| ok(c))
+        .min_by(|&a, &b| {
+            let (ax, ay) = centre(a);
+            let (bx, by) = centre(b);
+            ((ax - x).powi(2) + (ay - y).powi(2)).total_cmp(&((bx - x).powi(2) + (by - y).powi(2)))
         })
-        .unwrap()
+        .expect("no matching cell")
 }
 
-fn is_perimeter(city: &City, c: Cell) -> bool {
-    Dir::ALL.iter().any(|&d| match city.step(c, d) {
-        None => true,
-        Some(n) => city.ground_at(n) == Ground::Outside,
-    })
-}
-
-/// The Yamen compound near the middle, ringed by a lane so it stays reachable.
-fn place_yamen(city: &mut City) {
-    let cells = inside_cells(city);
-    let n = cells.len() as f32;
-    let ci = cells.iter().map(|c| c.0 as f32).sum::<f32>() / n;
-    let cj = cells.iter().map(|c| c.1 as f32).sum::<f32>() / n;
-    let (hw, hd) = (5i32, 4i32); // ~30 m x 24 m
-    for dj in -hd - 1..=hd {
-        for di in -hw - 1..=hw {
-            let (i, j) = (ci as i32 + di, cj as i32 + dj);
-            if !city.in_bounds(i, j) {
-                continue;
-            }
-            let c = (i as u16, j as u16);
-            if city.ground_at(c) == Ground::Outside {
-                continue;
-            }
-            let ring = di == -hw - 1 || di == hw || dj == -hd - 1 || dj == hd;
-            let k = city.idx(c);
-            city.ground[k] = if ring { Ground::Alley } else { Ground::Yamen };
-        }
-    }
-}
-
-/// Dijkstra from `from` until any alley cell is reached, over buildable land.
-/// Costs are noisy (so lanes wander) and penalise hugging existing lanes.
-fn noisy_path(city: &City, noise: &[f32], from: Cell) -> Option<Vec<Cell>> {
-    let n = city.w * city.d;
-    let mut dist = vec![f32::MAX; n];
-    let mut prev = vec![u32::MAX; n];
-    let mut heap = BinaryHeap::new();
-    let key = |f: f32| Reverse((f * 1000.0) as u64);
-    dist[city.idx(from)] = 0.0;
-    heap.push((key(0.0), from));
-    while let Some((Reverse(_), c)) = heap.pop() {
-        let ci = city.idx(c);
-        if city.ground[ci] == Ground::Alley && c != from {
-            let mut path = vec![c];
-            let mut k = ci;
-            while prev[k] != u32::MAX {
-                k = prev[k] as usize;
-                path.push(((k % city.w) as u16, (k / city.w) as u16));
-            }
-            return Some(path);
-        }
-        for (_, nb) in city.neighbours(c) {
-            let g = city.ground_at(nb);
-            if g != Ground::Plot && g != Ground::Alley {
-                continue;
-            }
-            let hugging = g == Ground::Plot
-                && city.neighbours(nb).any(|(_, x)| city.ground_at(x) == Ground::Alley)
-                && !city.neighbours(nb).any(|(_, x)| x == c);
-            let cost = 1.0 + noise[city.idx(nb)] * 7.0 + if hugging { 2.0 } else { 0.0 };
-            let nd = dist[ci] + cost;
-            let ni = city.idx(nb);
-            if nd < dist[ni] {
-                dist[ni] = nd;
-                prev[ni] = ci as u32;
-                heap.push((key(nd), nb));
-            }
-        }
-    }
-    None
+pub fn is_perimeter(city: &City, c: Cell) -> bool {
+    Dir::ALL.iter().any(|&d| city.step(c, d).map_or(true, |n| city.ground_at(n) == Ground::Outside))
 }
 
 fn smooth_noise(city: &City, rng: &mut impl Rng) -> Vec<f32> {
     let mut v: Vec<f32> = (0..city.w * city.d).map(|_| rng.gen::<f32>()).collect();
-    for _ in 0..3 {
+    for _ in 0..5 {
         let old = v.clone();
         for j in 0..city.d {
             for i in 0..city.w {
@@ -176,75 +134,6 @@ fn smooth_noise(city: &City, rng: &mut impl Rng) -> Vec<f32> {
     let (lo, hi) = v.iter().fold((f32::MAX, f32::MIN), |(a, b), &x| (a.min(x), b.max(x)));
     v.iter_mut().for_each(|x| *x = ((*x - lo) / (hi - lo)).powi(2));
     v
-}
-
-fn carve(city: &mut City, path: &[Cell]) {
-    for &c in path {
-        let k = city.idx(c);
-        if city.ground[k] == Ground::Plot {
-            city.ground[k] = Ground::Alley;
-        }
-    }
-}
-
-fn carve_alleys(city: &mut City) {
-    let mut rng = rng_for(city.params.seed, 1);
-    let noise = smooth_noise(city, &mut rng);
-
-    // Entrances: the South Gate plus a spread of perimeter openings.
-    let mut perim: Vec<Cell> = inside_cells(city)
-        .into_iter()
-        .filter(|&c| city.ground_at(c) == Ground::Plot && is_perimeter(city, c))
-        .collect();
-    perim.shuffle(&mut rng);
-    let mut entrances = vec![city.south_gate];
-    for c in perim {
-        if entrances.len() >= 9 {
-            break;
-        }
-        if entrances.iter().all(|e| (e.0 as i32 - c.0 as i32).abs() + (e.1 as i32 - c.1 as i32).abs() > 18) {
-            entrances.push(c);
-        }
-    }
-
-    // Trunk lanes: each entrance to the network (the Yamen ring first).
-    for (n, &e) in entrances.iter().enumerate() {
-        let k = city.idx(e);
-        city.ground[k] = Ground::Plot; // start from land so noisy_path walks inward
-        if let Some(path) = noisy_path(city, &noise, e) {
-            carve(city, &path);
-            let name = LANE_NAMES[n % LANE_NAMES.len()].to_string();
-            city.lanes.push(Lane { name, cells: path });
-        }
-        let k = city.idx(e);
-        city.ground[k] = Ground::Alley;
-    }
-
-    // Coverage: keep carving from the cell farthest from any lane until every
-    // buildable cell is within `alley_spacing` of one.
-    let spacing = city.params.alley_spacing.max(2);
-    loop {
-        let dist = distance_to_alley(city);
-        let mut far: Vec<(u32, Cell)> = inside_cells(city)
-            .into_iter()
-            .filter(|&c| city.ground_at(c) == Ground::Plot)
-            .map(|c| (dist[city.idx(c)], c))
-            .filter(|&(d, _)| d > spacing && d != u32::MAX)
-            .collect();
-        if far.is_empty() {
-            break;
-        }
-        let maxd = far.iter().map(|f| f.0).max().unwrap();
-        far.retain(|f| f.0 == maxd);
-        let (_, c) = far[rng.gen_range(0..far.len())];
-        match noisy_path(city, &noise, c) {
-            Some(path) => carve(city, &path),
-            None => {
-                let k = city.idx(c);
-                city.ground[k] = Ground::Well;
-            }
-        }
-    }
 }
 
 fn distance_to_alley(city: &City) -> Vec<u32> {
@@ -269,13 +158,183 @@ fn distance_to_alley(city: &City) -> Vec<u32> {
     dist
 }
 
-fn touches_alley(city: &City, c: Cell) -> bool {
+/// Noisy Dijkstra over land (and existing lanes, cheaply) from `from` to the
+/// first cell satisfying `goal`. Penalises running close alongside a lane so
+/// parallel lanes leave room for buildings between them.
+fn noisy_path(city: &City, noise: &[f32], from: Cell, goal: &dyn Fn(Cell) -> bool) -> Option<Vec<Cell>> {
+    let near = distance_to_alley(city);
+    let n = city.w * city.d;
+    let mut dist = vec![f32::MAX; n];
+    let mut prev = vec![u32::MAX; n];
+    let mut heap = BinaryHeap::new();
+    let key = |f: f32| Reverse((f * 1000.0) as u64);
+    dist[city.idx(from)] = 0.0;
+    heap.push((key(0.0), from));
+    while let Some((Reverse(kd), c)) = heap.pop() {
+        let ci = city.idx(c);
+        if (kd as f32) / 1000.0 > dist[ci] + 0.01 {
+            continue;
+        }
+        if c != from && goal(c) {
+            let mut path = vec![c];
+            let mut k = ci;
+            while prev[k] != u32::MAX {
+                k = prev[k] as usize;
+                path.push(((k % city.w) as u16, (k / city.w) as u16));
+            }
+            path.reverse();
+            return Some(path);
+        }
+        for (_, nb) in city.neighbours(c) {
+            let ni = city.idx(nb);
+            let cost = match city.ground[ni] {
+                Ground::Alley => 0.4,
+                Ground::Plot => {
+                    let hug = match near[ni] {
+                        1 | 2 => 3.0,
+                        3 => 1.0,
+                        _ => 0.0,
+                    };
+                    1.0 + noise[ni] * 6.0 + hug
+                }
+                _ => continue,
+            };
+            let nd = dist[ci] + cost;
+            if nd < dist[ni] {
+                dist[ni] = nd;
+                prev[ni] = ci as u32;
+                heap.push((key(nd), nb));
+            }
+        }
+    }
+    None
+}
+
+fn carve(city: &mut City, path: &[Cell]) {
+    for &c in path {
+        let k = city.idx(c);
+        if city.ground[k] == Ground::Plot {
+            city.ground[k] = Ground::Alley;
+        }
+    }
+}
+
+fn add_lane(city: &mut City, name: &str, path: Vec<Cell>) {
+    carve(city, &path);
+    city.lanes.push(Lane { name: name.to_string(), cells: path });
+}
+
+fn carve_lanes(city: &mut City) {
+    let mut rng = rng_for(city.params.seed, 1);
+    let noise = smooth_noise(city, &mut rng);
+    let perim: Vec<Cell> = all_cells(city).into_iter().filter(|&c| city.ground_at(c) == Ground::Plot && is_perimeter(city, c)).collect();
+    let (min_i, max_i) = (perim.iter().map(|c| c.0).min().unwrap(), perim.iter().map(|c| c.0).max().unwrap());
+    let (min_j, max_j) = (perim.iter().map(|c| c.1).min().unwrap(), perim.iter().map(|c| c.1).max().unwrap());
+    let mid_j = (min_j + max_j) / 2;
+
+
+    // Lung Chun Road: the old axis from the South Gate up to the Yamen.
+    let gate = city.south_gate;
+    if let Some(p) = path_to_alley(city, &noise, gate) {
+        let mut p = p;
+        p.insert(0, gate);
+        add_lane(city, "Lung Chun Road", p);
+    }
+
+    // Lung Chun Back Road: one of the few lanes running right across, west to east.
+    let pick = |rng: &mut rand_chacha::ChaCha8Rng, f: &dyn Fn(&Cell) -> bool| -> Cell {
+        let c: Vec<Cell> = perim.iter().copied().filter(|c| f(c)).collect();
+        c[rng.gen_range(0..c.len())]
+    };
+    let west = pick(&mut rng, &|c| c.0 < min_i + (max_i - min_i) / 8 && (c.1 as i32 - mid_j as i32).abs() < 12);
+    let east = pick(&mut rng, &|c| c.0 > max_i - (max_i - min_i) / 8);
+    if let Some(p) = noisy_path(city, &noise, west, &|c| c == east) {
+        add_lane(city, "Lung Chun Back Road", p);
+    }
+
+    // Lo Yan Street: in from Tung Tau Tsuen Road on the north side.
+    let north = pick(&mut rng, &|c| c.1 < min_j + (max_j - min_j) / 5 && c.0 > min_i + (max_i - min_i) / 3);
+    if let Some(mut p) = path_to_alley(city, &noise, north) {
+        p.insert(0, north);
+        add_lane(city, "Lo Yan Street", p);
+    }
+
+    // Sai Shing (West City) Road: north–south through the west side.
+    let wn = pick(&mut rng, &|c| c.0 < min_i + (max_i - min_i) / 3 && c.1 < mid_j);
+    let ws = pick(&mut rng, &|c| c.0 < min_i + (max_i - min_i) / 3 && c.1 > mid_j);
+    if let Some(p) = noisy_path(city, &noise, wn, &|c| c == ws) {
+        add_lane(city, "Sai Shing Road", p);
+    }
+
+    // Other named lanes, then the many unnamed "narrow openings between shops".
+    let mut openings: Vec<Cell> = perim.clone();
+    openings.shuffle(&mut rng);
+    let mut used: Vec<Cell> = city.lanes.iter().flat_map(|l| [l.cells[0], *l.cells.last().unwrap()]).collect();
+    let named = ["Tai Chang Street", "Kwong Ming Street", "Shing Ngam Road", "Mung Chun Road", "Lung Shing Road"];
+    let mut n_open = 0;
+    for c in openings {
+        if n_open >= named.len() + 14 {
+            break;
+        }
+        if city.ground_at(c) != Ground::Plot || used.iter().any(|u| (u.0 as i32 - c.0 as i32).abs() + (u.1 as i32 - c.1 as i32).abs() < 16) {
+            continue;
+        }
+        if let Some(mut p) = path_to_alley(city, &noise, c) {
+            p.insert(0, c);
+            let name = named.get(n_open).map_or("", |s| s);
+            add_lane(city, name, p);
+            used.push(c);
+            n_open += 1;
+        }
+    }
+    city.lanes.retain(|l| !l.name.is_empty());
+
+    // Coverage: keep carving from the cell farthest from any lane until every
+    // buildable cell is within `alley_spacing` of one.
+    let spacing = city.params.alley_spacing.max(3);
+    loop {
+        let dist = distance_to_alley(city);
+        let far: Vec<(u32, Cell)> = all_cells(city)
+            .into_iter()
+            .filter(|&c| city.ground_at(c) == Ground::Plot)
+            .map(|c| (dist[city.idx(c)], c))
+            .filter(|&(d, _)| d > spacing && d != u32::MAX)
+            .collect();
+        let Some(maxd) = far.iter().map(|f| f.0).max() else { break };
+        let far: Vec<Cell> = far.into_iter().filter(|f| f.0 == maxd).map(|f| f.1).collect();
+        let c = far[rng.gen_range(0..far.len())];
+        match path_to_alley(city, &noise, c) {
+            Some(path) => carve(city, &path),
+            None => {
+                let k = city.idx(c);
+                city.ground[k] = Ground::Well;
+            }
+        }
+    }
+}
+
+pub fn touches_alley(city: &City, c: Cell) -> bool {
     city.neighbours(c).any(|(_, n)| city.ground_at(n) == Ground::Alley)
+}
+
+fn component(city: &City, start: Cell, ok: impl Fn(Cell) -> bool) -> Vec<Cell> {
+    let mut comp = vec![start];
+    let mut seen = std::collections::HashSet::from([start]);
+    let mut q = VecDeque::from([start]);
+    while let Some(x) = q.pop_front() {
+        for (_, n) in city.neighbours(x) {
+            if ok(n) && seen.insert(n) {
+                comp.push(n);
+                q.push_back(n);
+            }
+        }
+    }
+    comp
 }
 
 fn make_plots(city: &mut City) {
     let mut rng = rng_for(city.params.seed, 2);
-    let land: Vec<Cell> = inside_cells(city).into_iter().filter(|&c| city.ground_at(c) == Ground::Plot).collect();
+    let land: Vec<Cell> = all_cells(city).into_iter().filter(|&c| city.ground_at(c) == Ground::Plot).collect();
 
     // Seeds along the lanes, a few cells apart.
     let mut cand: Vec<Cell> = land.iter().copied().filter(|&c| touches_alley(city, c)).collect();
@@ -296,7 +355,7 @@ fn make_plots(city: &mut City) {
         let k = city.idx(s);
         city.plot_of[k] = id;
         plot_cells.push(vec![s]);
-        caps.push(rng.gen_range(6..=14));
+        caps.push(rng.gen_range(10..=30));
         for (_, n) in city.neighbours(s) {
             frontier.push((id, n));
         }
@@ -309,7 +368,7 @@ fn make_plots(city: &mut City) {
         }
         // Keep plots compact: defer cells that would only hang off one side.
         let same = city.neighbours(c).filter(|(_, n)| city.plot_of[city.idx(*n)] == p).count();
-        if same < 2 && plot_cells[p as usize].len() > 2 && rng.gen::<f32>() < 0.8 {
+        if same < 2 && plot_cells[p as usize].len() > 2 && rng.gen::<f32>() < 0.85 {
             frontier.push((p, c));
             continue;
         }
@@ -320,74 +379,73 @@ fn make_plots(city: &mut City) {
         }
     }
 
-    // Leftover land: components touching a lane become their own plot, others wells.
+    // Leftover land: big enough and on a lane → own plot; otherwise merge into a
+    // neighbouring plot, or (rarely, or if landlocked) stay open as a light well.
     for &c in &land {
-        if city.plot_of[city.idx(c)] != NO_PLOT || city.ground_at(c) != Ground::Plot {
+        let k = city.idx(c);
+        if city.plot_of[k] != NO_PLOT || city.ground[k] != Ground::Plot {
             continue;
         }
-        let mut comp = vec![c];
-        let mut q = VecDeque::from([c]);
-        let mut seen = std::collections::HashSet::from([c]);
-        while let Some(x) = q.pop_front() {
-            for (_, n) in city.neighbours(x) {
-                let k = city.idx(n);
-                if city.ground[k] == Ground::Plot && city.plot_of[k] == NO_PLOT && seen.insert(n) {
-                    comp.push(n);
-                    q.push_back(n);
-                }
-            }
-        }
-        if comp.len() >= 3 && comp.iter().any(|&x| touches_alley(city, x)) {
-            let id = plot_cells.len() as u32;
-            for &x in &comp {
-                let k = city.idx(x);
-                city.plot_of[k] = id;
-            }
-            plot_cells.push(comp);
+        let comp = component(city, c, |n| city.ground_at(n) == Ground::Plot && city.plot_of[city.idx(n)] == NO_PLOT);
+        let target = if comp.len() >= MIN_PLOT && comp.iter().any(|&x| touches_alley(city, x)) {
+            plot_cells.push(vec![]);
+            Some(plot_cells.len() as u32 - 1)
+        } else if rng.gen::<f32>() < city.params.well_tolerance {
+            None
         } else {
-            for &x in &comp {
-                let k = city.idx(x);
-                city.ground[k] = Ground::Well;
-                city.plot_of[k] = u32::MAX - 1; // mark visited
+            comp.iter().find_map(|&x| city.neighbours(x).find_map(|(_, n)| {
+                let p = city.plot_of[city.idx(n)];
+                (p != NO_PLOT).then_some(p)
+            }))
+        };
+        for &x in &comp {
+            let k = city.idx(x);
+            match target {
+                Some(p) => {
+                    city.plot_of[k] = p;
+                    plot_cells[p as usize].push(x);
+                }
+                None => city.ground[k] = Ground::Well,
             }
-        }
-    }
-    for k in 0..city.plot_of.len() {
-        if city.plot_of[k] == u32::MAX - 1 {
-            city.plot_of[k] = NO_PLOT;
         }
     }
 
-    // Tiny plots become light wells (some always; small ones by tolerance).
-    let mut keep = vec![true; plot_cells.len()];
-    for (p, cells) in plot_cells.iter().enumerate() {
-        if cells.len() < 3 || (cells.len() <= 4 && rng.gen::<f32>() < city.params.well_tolerance) {
-            keep[p] = false;
+    // Plots too small to hold a stair and a room: fold into a neighbour or well.
+    for p in 0..plot_cells.len() {
+        if plot_cells[p].is_empty() || plot_cells[p].len() >= MIN_PLOT {
+            continue;
+        }
+        let cells = std::mem::take(&mut plot_cells[p]);
+        let nb = cells.iter().find_map(|&x| {
+            city.neighbours(x).find_map(|(_, n)| {
+                let q = city.plot_of[city.idx(n)];
+                (q != NO_PLOT && q as usize != p && !plot_cells[q as usize].is_empty()).then_some(q)
+            })
+        });
+        for x in cells {
+            let k = city.idx(x);
+            match nb {
+                Some(q) => {
+                    city.plot_of[k] = q;
+                    plot_cells[q as usize].push(x);
+                }
+                None => {
+                    city.plot_of[k] = NO_PLOT;
+                    city.ground[k] = Ground::Well;
+                }
+            }
         }
     }
 
     // Renumber and build Plot records with core + corridors.
     let mut remap = vec![NO_PLOT; plot_cells.len()];
     for (p, cells) in plot_cells.into_iter().enumerate() {
-        if !keep[p] {
-            for c in cells {
-                let k = city.idx(c);
-                city.ground[k] = Ground::Well;
-                city.plot_of[k] = NO_PLOT;
-            }
+        if cells.is_empty() {
             continue;
         }
         let id = city.plots.len() as u32;
         remap[p] = id;
-        city.plots.push(Plot {
-            id,
-            cells,
-            core: (0, 0),
-            founded: 0,
-            rebuilt: 0,
-            floor_year: [0; MAX_FLOORS],
-            ambition: 0,
-        });
+        city.plots.push(Plot { id, cells, core: vec![], founded: 0, rebuilt: 0, floor_year: [0; MAX_FLOORS], ambition: 0 });
     }
     for k in 0..city.plot_of.len() {
         let p = city.plot_of[k];
@@ -400,87 +458,112 @@ fn make_plots(city: &mut City) {
     }
 }
 
-/// Choose the stair core (touching a lane, minimising walking depth) and mark the
-/// corridor cells every room needs to reach it.
+fn bfs_in_plot(city: &City, pid: u32, from: &[Cell]) -> (HashMap<Cell, u32>, HashMap<Cell, Cell>) {
+    let mut depth: HashMap<Cell, u32> = from.iter().map(|&c| (c, 0)).collect();
+    let mut parent = HashMap::new();
+    let mut q: VecDeque<Cell> = from.iter().copied().collect();
+    while let Some(c) = q.pop_front() {
+        for (_, n) in city.neighbours(c) {
+            if city.plot_of[city.idx(n)] == pid && !depth.contains_key(&n) {
+                depth.insert(n, depth[&c] + 1);
+                parent.insert(n, c);
+                q.push_back(n);
+            }
+        }
+    }
+    (depth, parent)
+}
+
+/// Stair core: two cells (a steep 1.5 × 3 m switchback), the first opening onto a
+/// lane, placed to minimise walking depth. Then corridors so no room is more than
+/// ROOM_REACH cells from circulation.
 fn lay_out_circulation(city: &mut City, p: usize, rng: &mut impl Rng) {
     let cells = city.plots[p].cells.clone();
     let pid = p as u32;
-    let bfs = |city: &City, from: Cell, shuffle: &mut dyn FnMut(&mut Vec<Cell>)| {
-        let mut depth = std::collections::HashMap::from([(from, 0u32)]);
-        let mut parent = std::collections::HashMap::new();
-        let mut q = VecDeque::from([from]);
-        while let Some(c) = q.pop_front() {
-            let mut ns: Vec<Cell> = city.neighbours(c).map(|x| x.1).collect();
-            shuffle(&mut ns);
-            for n in ns {
-                if city.plot_of[city.idx(n)] == pid && !depth.contains_key(&n) {
-                    depth.insert(n, depth[&c] + 1);
-                    parent.insert(n, c);
-                    q.push_back(n);
-                }
-            }
-        }
-        (depth, parent)
-    };
 
-    let mut best: Option<(u32, Cell)> = None;
+    let mut best: Option<(u32, Vec<Cell>)> = None;
     let mut cands: Vec<Cell> = cells.iter().copied().filter(|&c| touches_alley(city, c)).collect();
     cands.shuffle(rng);
-    for c in cands {
-        let (depth, _) = bfs(city, c, &mut |_| {});
-        let m = *depth.values().max().unwrap();
-        if best.map_or(true, |b| m < b.0) {
-            best = Some((m, c));
+    for &c in cands.iter().take(12) {
+        for (_, n) in city.neighbours(c) {
+            if city.plot_of[city.idx(n)] != pid {
+                continue;
+            }
+            let core = vec![c, n];
+            let (depth, _) = bfs_in_plot(city, pid, &core);
+            if depth.len() < cells.len() {
+                continue; // core would split the plot
+            }
+            let m = *depth.values().max().unwrap();
+            if best.as_ref().map_or(true, |b| m < b.0) {
+                best = Some((m, core));
+            }
         }
     }
-    let core = best.map(|b| b.1).unwrap_or(cells[0]);
-    let (depth, _) = bfs(city, core, &mut |_| {});
+    let core = best.map(|b| b.1).unwrap_or_else(|| vec![cands.first().copied().unwrap_or(cells[0])]);
+    let (depth, parent) = bfs_in_plot(city, pid, &core);
 
     for &c in &cells {
         let k = city.idx(c);
         city.role[k] = Role::Room;
     }
-    let k = city.idx(core);
-    city.role[k] = Role::Core;
+    for &c in &core {
+        let k = city.idx(c);
+        city.role[k] = Role::Core;
+    }
 
-    // Minimal-ish corridor: walk cells outward by depth; a room not already beside
-    // the core or a corridor turns one shallower neighbour into corridor. That
-    // neighbour was itself satisfied earlier, so corridors always chain to the core.
+    let circ = |city: &City, x: Cell| city.plot_of[city.idx(x)] == pid && matches!(city.role_at(x), Role::Core | Role::Corridor);
+    // Room-distance from `c` to a room touching circulation (None if > ROOM_REACH).
+    let reach = |city: &City, c: Cell| -> Option<u32> {
+        let mut seen = HashMap::from([(c, 0u32)]);
+        let mut q = VecDeque::from([c]);
+        while let Some(x) = q.pop_front() {
+            let dx = seen[&x];
+            if city.neighbours(x).any(|(_, n)| circ(city, n)) {
+                return Some(dx);
+            }
+            if dx >= ROOM_REACH {
+                continue;
+            }
+            for (_, n) in city.neighbours(x) {
+                if city.plot_of[city.idx(n)] == pid && city.role_at(n) == Role::Room && !seen.contains_key(&n) {
+                    seen.insert(n, dx + 1);
+                    q.push_back(n);
+                }
+            }
+        }
+        None
+    };
+
+    // Walk outward; a room too far from circulation extends a corridor towards it
+    // along the BFS tree, stopping as soon as the corridor touches existing circulation.
     let mut by_depth: Vec<Cell> = cells.clone();
     by_depth.shuffle(rng);
     by_depth.sort_by_key(|c| depth[c]);
     for c in by_depth {
-        let dc = depth[&c];
-        if dc < 2 {
+        if city.role_at(c) != Role::Room || reach(city, c).is_some() {
             continue;
         }
-        // Served = touches circulation, or sits behind a room that does (a flat can
-        // be two rooms deep with one front door).
-        let circ = |x: Cell| city.plot_of[city.idx(x)] == pid && matches!(city.role_at(x), Role::Core | Role::Corridor);
-        let front = |x: Cell| {
-            city.plot_of[city.idx(x)] == pid && city.role_at(x) == Role::Room && city.neighbours(x).any(|(_, y)| circ(y))
-        };
-        let served = city.neighbours(c).any(|(_, n)| circ(n) || front(n));
-        if served {
-            continue;
-        }
-        let ups: Vec<Cell> = city
-            .neighbours(c)
-            .map(|x| x.1)
-            .filter(|n| city.plot_of[city.idx(*n)] == pid && depth.get(n) == Some(&(dc - 1)))
-            .collect();
-        // `pick` was served earlier: either it touches circulation, or it sits behind
-        // a front room that does. Promote whatever keeps the chain to the core intact.
-        let pick = *ups.choose(rng).unwrap();
-        let mut promote = vec![pick];
-        if !city.neighbours(pick).any(|(_, n)| circ(n)) {
-            let via = city.neighbours(pick).map(|x| x.1).find(|&n| front(n)).expect("served cell has a front room");
-            promote.push(via);
-        }
-        for x in promote {
+        let mut prev = c;
+        let mut x = parent[&c];
+        loop {
             let k = city.idx(x);
+            if city.role[k] != Role::Room {
+                break;
+            }
+            // Touching circulation *other than* the corridor this chain just laid.
+            let touching = city.neighbours(x).any(|(_, n)| n != prev && circ(city, n));
             city.role[k] = Role::Corridor;
+            if touching {
+                break;
+            }
+            prev = x;
+            x = parent[&x];
         }
     }
     city.plots[p].core = core;
+}
+
+fn path_to_alley(city: &City, noise: &[f32], from: Cell) -> Option<Vec<Cell>> {
+    noisy_path(city, noise, from, &|c| city.ground_at(c) == Ground::Alley)
 }

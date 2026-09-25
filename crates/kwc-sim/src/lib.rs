@@ -6,10 +6,12 @@
 pub mod circulation;
 pub mod city;
 pub mod export;
+pub mod features;
 pub mod growth;
 pub mod interior;
 pub mod layout;
 pub mod site;
+pub mod stats;
 pub mod units;
 pub mod walk;
 
@@ -33,7 +35,7 @@ pub struct Params {
 
 impl Default for Params {
     fn default() -> Self {
-        Params { seed: 1987, demand: 1.0, alley_spacing: 4, well_tolerance: 0.25 }
+        Params { seed: 1987, demand: 1.0, alley_spacing: 7, well_tolerance: 0.15 }
     }
 }
 
@@ -48,5 +50,6 @@ pub fn generate(params: &Params) -> City {
     growth::grow(&mut city);
     units::subdivide(&mut city);
     circulation::add_bridges(&mut city);
+    features::place(&mut city);
     city
 }

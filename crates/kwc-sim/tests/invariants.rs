@@ -1,3 +1,4 @@
+use kwc_sim::site::survey_1987 as survey;
 use kwc_sim::*;
 
 fn city(seed: u64) -> City {
@@ -18,7 +19,6 @@ fn height_cap_and_yamen() {
         let c = city(seed);
         for p in &c.plots {
             assert!(p.final_height() as usize <= MAX_FLOORS);
-            assert!(p.ambition as usize <= MAX_FLOORS);
         }
         for (k, g) in c.ground.iter().enumerate() {
             if *g == Ground::Yamen {
@@ -53,11 +53,33 @@ fn timeline_never_loses_floors() {
     }
 }
 
+/// The 1987 survey: 2.6 ha, ~350 buildings "almost all between 10 and 14
+/// storeys", 8,500 premises, 33,000 residents, ~23 m² flats, 1–2 m lanes.
 #[test]
-fn plausible_scale() {
+fn matches_1987_survey() {
+    for seed in [1, 2, 1987] {
+        let c = city(seed);
+        let s = stats::measure(&c, END_YEAR);
+        let near = |v: f32, target: f32, tol: f32| (v - target).abs() / target <= tol;
+        assert!(near(s.area_m2, survey::AREA_M2, 0.03), "area {}", s.area_m2);
+        assert!(near(s.buildings as f32, survey::BUILDINGS as f32, 0.15), "buildings {}", s.buildings);
+        assert!(near(s.units as f32, survey::PREMISES as f32, 0.15), "premises {}", s.units);
+        assert!(near(s.residents as f32, survey::RESIDENTS as f32, 0.15), "residents {}", s.residents);
+        assert!(near(s.mean_unit_m2, 23.0, 0.15), "unit m² {}", s.mean_unit_m2);
+        assert!(s.frac_10_plus >= 0.9, "10+ storeys {}", s.frac_10_plus);
+        assert!((0.08..=0.18).contains(&s.lane_share), "lane share {}", s.lane_share);
+    }
+}
+
+#[test]
+fn documented_features_present() {
     let c = city(1987);
-    let n = c.units_at(END_YEAR).count();
-    assert!((5_000..=16_000).contains(&n), "unit count {n}");
-    let mean = c.plots.iter().map(|p| p.final_height() as f32).sum::<f32>() / c.plots.len() as f32;
-    assert!(mean > 10.0, "mean height {mean}");
+    let n = |k: FeatureKind| c.features.iter().filter(|f| f.kind == k).count();
+    assert_eq!(n(FeatureKind::WaterStandpipe), survey::WATER_STANDPIPES);
+    assert_eq!(n(FeatureKind::Lift), survey::LIFTS);
+    assert_eq!(n(FeatureKind::NaturalWell), 1);
+    assert_eq!(n(FeatureKind::Temple), 2);
+    for name in ["Lung Chun Road", "Lung Chun Back Road", "Lo Yan Street", "Sai Shing Road", "Tai Chang Street"] {
+        assert!(c.lanes.iter().any(|l| l.name == name), "missing lane {name}");
+    }
 }

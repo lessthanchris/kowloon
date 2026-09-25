@@ -1,7 +1,9 @@
 //! Headless tuning tool: `cargo run -p kwc-sim --bin dump -- [seed] [out_dir]`
-//! Writes plan PNGs across the timeline plus a stats table and city.json.
+//! Writes plan PNGs across the timeline, compares against the 1987 survey, and
+//! writes city.json.
 
 use kwc_sim::export::{render_map, to_json, MapMode};
+use kwc_sim::site::survey_1987 as survey;
 use kwc_sim::*;
 
 fn main() {
@@ -13,35 +15,25 @@ fn main() {
     let t = std::time::Instant::now();
     let city = generate(&Params { seed, ..Default::default() });
     println!("seed {seed}: generated in {:.0?}", t.elapsed());
-    println!(
-        "grid {}x{} ({:.0} x {:.0} m), plots {}, lanes {}, bridges {}, units {}",
-        city.w,
-        city.d,
-        city.w as f32 * CELL_M,
-        city.d as f32 * CELL_M,
-        city.plots.len(),
-        city.lanes.len(),
-        city.bridges.len(),
-        city.units.len()
-    );
-    let count = |g: Ground| city.ground.iter().filter(|&&x| x == g).count();
-    println!(
-        "cells: plot {}  alley {}  well {}  yamen {}",
-        count(Ground::Plot),
-        count(Ground::Alley),
-        count(Ground::Well),
-        count(Ground::Yamen)
-    );
+    let s = stats::measure(&city, END_YEAR);
+    println!("grid {}x{} cells of {CELL_M} m, lanes named: {}", city.w, city.d, city.lanes.iter().map(|l| l.name.as_str()).collect::<Vec<_>>().join(", "));
+    println!("                    model     1987 survey");
+    println!("site area m²      {:7.0}     {:7.0}", s.area_m2, survey::AREA_M2);
+    println!("buildings         {:7}     {:7}", s.buildings, survey::BUILDINGS);
+    println!("premises (units)  {:7}     {:7}", s.units, survey::PREMISES);
+    println!("residents (est.)  {:7}     {:7}", s.residents, survey::RESIDENTS);
+    println!("mean unit m²      {:7.1}     {:7.1}", s.mean_unit_m2, 23.0);
+    println!("bldgs >= 10 storeys {:5.0}%     'almost all'", s.frac_10_plus * 100.0);
+    println!("lane share        {:6.1}%", s.lane_share * 100.0);
+    println!("light wells       {:6.1}%", s.well_share * 100.0);
+    println!("corridor share    {:6.1}% of building cells", s.corridor_share * 100.0);
+    println!("bridges {}, features {}", city.bridges.len(), city.features.len());
 
-    println!("\nyear  settled  mean_h  at_cap  units   ~people");
-    for year in (START_YEAR..=END_YEAR).step_by(1) {
-        let hs: Vec<u8> = city.plots.iter().map(|p| p.height_at(year)).collect();
-        let settled = hs.iter().filter(|&&h| h > 0).count();
-        let mean = hs.iter().map(|&h| h as f32).sum::<f32>() / hs.len() as f32;
-        let cap = hs.iter().filter(|&&h| h as usize >= MAX_FLOORS).count();
-        let units = city.units_at(year).count();
+    println!("\nyear  settled  mean_h  at_cap  units  ~people");
+    for year in START_YEAR..=END_YEAR {
         if year % 5 == 0 || year == END_YEAR {
-            println!("{year}  {settled:7}  {mean:6.1}  {cap:6}  {units:5}  {:8}", (units as f32 * 3.4) as u32);
+            let s = stats::measure(&city, year);
+            println!("{year}  {:7}  {:6.1}  {:6}  {:5}  {:7}", s.settled, s.mean_height, s.at_cap, s.units, s.residents);
             render_map(&city, year, MapMode::Height).save(out.join(format!("height_{year}.png"))).unwrap();
         }
     }

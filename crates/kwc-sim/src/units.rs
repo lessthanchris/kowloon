@@ -43,7 +43,7 @@ fn floor_units(city: &City, p: usize, floor: u8, rng: &mut impl Rng, out: &mut V
             continue;
         }
         let g = groups.len();
-        let size = *[1usize, 2, 2, 3, 3, 4].choose(rng).unwrap();
+        let size = rng.gen_range(13..=28); // ~23 m² average flat (1987 survey)
         let mut cells = vec![start];
         owner.insert(start, g);
         let mut q = VecDeque::from([start]);
@@ -104,14 +104,14 @@ fn floor_units(city: &City, p: usize, floor: u8, rng: &mut impl Rng, out: &mut V
         let usage = pick_use(floor, on_lane, rng);
         let open_p = if on_lane { 0.35 } else { 0.04 };
         let door_state = if rng.gen::<f32>() < open_p { DoorState::Open } else { DoorState::Closed };
-        out.push(Unit { id: 0, plot: pid, floor, cells, door, usage, door_state });
+        out.push(Unit { id: 0, plot: pid, floor, cells, door, usage, door_state, name: None });
     }
 }
 
 fn pick_use(floor: u8, on_lane: bool, rng: &mut impl Rng) -> UnitUse {
     use UnitUse::*;
     let table: &[(UnitUse, u32)] = if on_lane {
-        &[(Shop, 30), (Workshop, 20), (FishballFactory, 10), (Dentist, 15), (Clinic, 5), (Restaurant, 15), (Temple, 2), (Flat, 3)]
+        &[(Shop, 30), (Workshop, 20), (FishballFactory, 10), (Dentist, 15), (Clinic, 5), (Restaurant, 15), (Flat, 3)]
     } else if floor <= 3 {
         &[(Flat, 60), (Workshop, 18), (FishballFactory, 6), (Dentist, 8), (Clinic, 4), (Shop, 4)]
     } else {

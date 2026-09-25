@@ -49,7 +49,7 @@ pub fn add_bridges(city: &mut City) {
     for (a, b, span) in cands {
         let (pa, pb) = (city.plot_of[city.idx(a)], city.plot_of[city.idx(b)]);
         let key = (pa.min(pb), pa.max(pb));
-        let p = if span.is_empty() { 0.5 } else { 0.35 };
+        let p = if span.is_empty() { 0.7 } else { 0.6 };
         if pairs.contains(&key) || rng.gen::<f32>() > p {
             continue;
         }
@@ -58,7 +58,7 @@ pub fn add_bridges(city: &mut City) {
         if top < 3 {
             continue;
         }
-        let n = if span.is_empty() { rng.gen_range(1..=2) } else { 1 };
+        let n = rng.gen_range(1..=3);
         for _ in 0..n {
             let floor = rng.gen_range(1..top - 1);
             let ya = city.plots[pa as usize].floor_year[floor as usize];

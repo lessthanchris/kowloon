@@ -4,7 +4,7 @@ use crate::city::*;
 use crate::site::MAX_FLOORS;
 use image::{Rgb, RgbImage};
 
-pub const PX: u32 = 6;
+pub const PX: u32 = 4;
 
 #[derive(Clone, Copy, Debug)]
 pub enum MapMode {
@@ -89,6 +89,26 @@ pub fn render_map(city: &City, year: u16, mode: MapMode) -> RgbImage {
                         px.0 = px.0.map(|v| (v as f32 * 0.55) as u8);
                     }
                 }
+            }
+        }
+    }
+    // Documented features: standpipes (cyan), natural well (blue), lifts (white),
+    // temples (red-gold), South Gate (orange).
+    for f in &city.features {
+        let col = match f.kind {
+            FeatureKind::WaterStandpipe => [60, 220, 230],
+            FeatureKind::NaturalWell => [40, 90, 255],
+            FeatureKind::Lift => [255, 255, 255],
+            FeatureKind::Temple => [230, 60, 40],
+            FeatureKind::SouthGate => [255, 150, 0],
+        };
+        let (i, j) = f.cell;
+        for y in 0..PX {
+            for x in 0..PX {
+                if (x == 0 || x == PX - 1) && (y == 0 || y == PX - 1) {
+                    continue;
+                }
+                img.put_pixel(i as u32 * PX + x, j as u32 * PX + y, Rgb(col));
             }
         }
     }
