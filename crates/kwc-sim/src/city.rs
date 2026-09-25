@@ -76,7 +76,8 @@ pub struct Plot {
     pub id: u32,
     pub cells: Vec<Cell>,
     /// `core[0]` is the landing (opens onto a lane at ground level); `core[1..5]` the
-    /// 2 x 2 stairwell: near-A (beside the landing), far-A, near-B, far-B.
+    /// 2 x 2 stairwell: near-A (beside the landing), far-A, near-B, far-B;
+    /// `core[5]` the second landing cell, in front of near-B.
     pub core: Vec<Cell>,
     /// Year the plot was first built on (0 = never).
     pub founded: u16,

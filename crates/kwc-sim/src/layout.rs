@@ -528,9 +528,10 @@ fn lay_out_circulation(city: &mut City, p: usize, rng: &mut impl Rng) -> bool {
     let cells = city.plots[p].cells.clone();
     let pid = p as u32;
 
-    // The stair is a 2 x 2 cell block (3 x 3 m) beside the landing: the landing
-    // opens onto the block's near-A cell; flights run away from it (A) and back (B).
-    let mut best: Option<(u32, Cell, [Cell; 4])> = None;
+    // The stair is a 2 x 2 cell well (3 x 3 m) with a landing two cells wide in
+    // front of it (like a real dog-leg): flight A climbs away from the landing,
+    // flight B comes back to it one storey up.
+    let mut best: Option<(u32, Cell, [Cell; 4], Cell)> = None;
     let mut cands: Vec<Cell> = cells.iter().copied().filter(|&c| touches_alley(city, c)).collect();
     cands.shuffle(rng);
     for (tried, &c) in cands.iter().enumerate() {
@@ -542,37 +543,39 @@ fn lay_out_circulation(city: &mut City, p: usize, rng: &mut impl Rng) -> bool {
                 if side == d || side == opposite(d) {
                     continue;
                 }
-                let (Some(fa), Some(nb)) = (city.step(na, d), city.step(na, side)) else { continue };
+                let (Some(fa), Some(nb), Some(l2)) = (city.step(na, d), city.step(na, side), city.step(c, side)) else { continue };
                 let Some(fb) = city.step(nb, d) else { continue };
                 let block = [na, fa, nb, fb];
-                if block.iter().any(|&x| city.plot_of[city.idx(x)] != pid || x == c) {
+                if block.iter().chain([&l2]).any(|&x| city.plot_of[city.idx(x)] != pid || x == c) {
                     continue;
                 }
                 let (depth, _) = bfs_in_plot(city, pid, &[c], &block);
-                if depth.len() + 4 < cells.len() {
+                if depth.len() + 4 < cells.len() || !depth.contains_key(&l2) {
                     continue; // the stairwell would cut the plot in two
                 }
                 let m = *depth.values().max().unwrap();
                 if best.map_or(true, |b| m < b.0) {
-                    best = Some((m, c, block));
+                    best = Some((m, c, block, l2));
                 }
             }
         }
     }
-    let Some((_, landing, block)) = best else { return false };
+    let Some((_, landing, block, landing2)) = best else { return false };
 
     for &c in &cells {
         let k = city.idx(c);
         city.role[k] = Role::Room;
         city.corr[k] = 0;
     }
-    let k = city.idx(landing);
-    city.role[k] = Role::Core;
+    for l in [landing, landing2] {
+        let k = city.idx(l);
+        city.role[k] = Role::Core;
+    }
     for x in block {
         let k = city.idx(x);
         city.role[k] = Role::Stair;
     }
-    city.plots[p].core = vec![landing, block[0], block[1], block[2], block[3]];
+    city.plots[p].core = vec![landing, block[0], block[1], block[2], block[3], landing2];
 
     // Every floor gets its own corridors: buildings were fitted out (and
     // re-partitioned) floor by floor, so no two storeys need look the same.

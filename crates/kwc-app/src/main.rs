@@ -66,7 +66,7 @@ impl World {
 /// Everything needed to walk around one year's city.
 struct Walk {
     world: world::WalkWorld,
-    interior: Option<GpuMesh>,
+    interior: Vec<GpuMesh>,
     player: player::Player,
     year: u16,
 }
@@ -79,7 +79,7 @@ impl Walk {
         lights::bake(city, year, &lamps, &mut [&mut mesh]);
         log::info!("walk world {year}: {} boxes, {} verts in {:.0?}", world.boxes.len(), mesh.vertices.len(), t.elapsed());
         let player = player::Player::new(world.spawn, world.spawn_yaw);
-        Walk { interior: GpuMesh::upload(&gpu.device, &mesh), world, player, year }
+        Walk { interior: GpuMesh::upload_chunked(&gpu.device, &mesh), world, player, year }
     }
 }
 
@@ -542,7 +542,7 @@ mod tests {
                 let p = well.point(u, v);
                 (p.x, p.z)
             };
-            let route = [pt(0.25, 0.75), pt(2.7, 0.75), pt(2.7, 2.25), pt(0.25, 2.25), pt(0.25, 0.75), lc];
+            let route = [pt(0.25, 0.75), pt(2.7, 0.75), pt(2.7, 2.25), pt(-0.4, 2.25), pt(-0.75, 0.75), lc];
             assert!(walk_to(&mut p, &w, &route), "stuck on the stair to floor {floor} at {:?}", p.pos);
             assert!((p.pos.y - floor as f32 * STOREY_M).abs() < 0.1, "floor {floor}: y = {}", p.pos.y);
         }

@@ -25,7 +25,12 @@ async fn device(adapter: &wgpu::Adapter) -> (wgpu::Device, wgpu::Queue) {
     adapter
         .request_device(&wgpu::DeviceDescriptor {
             label: Some("kwc device"),
-            required_limits: wgpu::Limits { max_texture_dimension_2d: 8192, ..wgpu::Limits::default() },
+            // Big city meshes: take the adapter's real buffer limit, not the portable default.
+            required_limits: wgpu::Limits {
+                max_texture_dimension_2d: 8192,
+                max_buffer_size: adapter.limits().max_buffer_size,
+                ..wgpu::Limits::default()
+            },
             ..Default::default()
         })
         .await

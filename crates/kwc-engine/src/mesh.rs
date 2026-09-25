@@ -112,6 +112,32 @@ pub struct GpuMesh {
 }
 
 impl GpuMesh {
+    /// Upload in pieces of at most `CHUNK` vertices, so no single buffer gets huge.
+    pub fn upload_chunked(device: &wgpu::Device, data: &MeshData) -> Vec<GpuMesh> {
+        const CHUNK: usize = 1 << 20;
+        let mut out = vec![];
+        let mut part = MeshData::default();
+        // Quads/boxes add vertices in groups whose indices only point inside the
+        // group, so we can split at any triangle whose vertices are all new.
+        let mut remap: std::collections::HashMap<u32, u32> = std::collections::HashMap::new();
+        for tri in data.indices.chunks_exact(3) {
+            if part.vertices.len() + 3 > CHUNK {
+                out.extend(Self::upload(device, &part));
+                part = MeshData::default();
+                remap.clear();
+            }
+            for &i in tri {
+                let k = *remap.entry(i).or_insert_with(|| {
+                    part.vertices.push(data.vertices[i as usize]);
+                    part.vertices.len() as u32 - 1
+                });
+                part.indices.push(k);
+            }
+        }
+        out.extend(Self::upload(device, &part));
+        out
+    }
+
     pub fn upload(device: &wgpu::Device, data: &MeshData) -> Option<GpuMesh> {
         if data.indices.is_empty() {
             return None;

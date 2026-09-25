@@ -17,10 +17,10 @@ pub const SLAB: f32 = 0.2;
 const WALL: f32 = 0.1;
 /// Stair: eight risers per half-flight (17.5 cm), half a storey each flight.
 const RISERS: usize = 8;
-/// Stairwell plan (a 3 x 3 m block): a strip at floor level by the landing, the
+/// Stairwell plan (a 3 x 3 m well): a lip at floor level by the landing, the
 /// flights' run, and the turning landing at the far end.
-const NEAR: f32 = 0.45;
-const RUN: f32 = 1.95;
+const NEAR: f32 = 0.1;
+const RUN: f32 = 2.1;
 const WELL: f32 = 2.0 * C;
 const PARAPET: f32 = 1.0;
 const DOOR_W: f32 = 0.95;
@@ -477,9 +477,8 @@ fn stairwell(b: &mut Builder, city: &City, plot: &Plot, h: i32) {
     let rise = S / 2.0 / RISERS as f32;
     let tread = RUN / RISERS as f32;
     let half = WELL / 2.0;
-    // Terrazzo treads and painted walls: pale enough to catch the bulbs.
+    // Terrazzo treads, pale enough to catch the bulbs.
     let step_col = srgb(150, 146, 136);
-    let wall_col = paint(plot.id, 7);
     b.mesh.ao = 0.12;
     // Floor-level strip by the landing on every floor, the roof (inside the hut)
     // included; the ground floor's is the ground.
@@ -498,8 +497,17 @@ fn stairwell(b: &mut Builder, city: &City, plot: &Plot, h: i32) {
         }
         let tl = y + S / 2.0;
         b.solid(w.bx(NEAR + RUN, WELL, 0.0, WELL, tl - 0.3, tl), step_col, ALL);
-        // Handrail between the flights (visual).
-        b.visual(w.bx(NEAR, NEAR + RUN, half - 0.03, half + 0.03, y, y + S * 0.5 + 1.0), concrete(0.5), 0.0, SIDES);
+        // A balustrade along the inside edge of each flight, stepping with it;
+        // between the two you can see up and down the well.
+        let rail = paint(plot.id, f);
+        for k in 1..=RISERS {
+            let kf = k as f32;
+            let (u0, u1) = (NEAR + (kf - 1.0) * tread, NEAR + kf * tread);
+            let ta = y + kf * rise;
+            b.solid(w.bx(u0, u1, half - 0.08, half - 0.02, ta, ta + 0.9), rail, ALL);
+            let tb = y + S / 2.0 + (RISERS - k + 1) as f32 * rise;
+            b.solid(w.bx(u0, u1, half + 0.02, half + 0.08, tb, tb + 0.9), rail, ALL);
+        }
         if let Some(bulb) = crate::lights::stair_bulb(plot, f) {
             b.visual(bulb, crate::lights::BULB_COL, 2.5, ALL);
         }
@@ -507,17 +515,24 @@ fn stairwell(b: &mut Builder, city: &City, plot: &Plot, h: i32) {
     // Walls round the well, open only to the landing.
     let top = h as f32 * S;
     let cells = &plot.core[1..5];
-    let in_well = |n: Cell| cells.contains(&n) || n == plot.core[0];
-    corner_posts(b, plot.core[1], 0.0, top, wall_col, &in_well, city);
-    for &c in cells {
-        for d in Dir::ALL {
-            let n = city.step(c, d);
-            if n.is_some_and(|n| cells.contains(&n) || n == plot.core[0] && c == plot.core[1]) {
-                continue;
+    let in_well = |n: Cell| cells.contains(&n) || n == plot.core[0] || n == plot.core[5];
+    // Walls painted storey by storey, matching that floor's landing, so the
+    // joints between landing and well line up in colour as well as plane.
+    for f in 0..h {
+        let (y0, y1) = (f as f32 * S, (f + 1) as f32 * S);
+        let col = paint(plot.id, f);
+        corner_posts(b, plot.core[1], y0, y1, col, &in_well, city);
+        for &c in cells {
+            for d in Dir::ALL {
+                let n = city.step(c, d);
+                if n.is_some_and(|n| cells.contains(&n) || (n == plot.core[0] && c == plot.core[1]) || (n == plot.core[5] && c == plot.core[3])) {
+                    continue;
+                }
+                b.solid(face_box(c, d, WALL, 0.0, C, y0, y1), col, except(d));
             }
-            b.solid(face_box(c, d, WALL, 0.0, C, 0.0, top), wall_col, except(d));
         }
     }
+    let _ = top;
     b.mesh.ao = 1.0;
 }
 
@@ -613,7 +628,7 @@ pub fn roof_furniture(city: &City, year: u16) -> (Vec<Piece>, Vec<Ladder>) {
                 if n.is_some_and(|n| cells.contains(&n)) {
                     continue;
                 }
-                if c == plot.core[1] && n == Some(plot.core[0]) {
+                if (c == plot.core[1] && n == Some(plot.core[0])) || (c == plot.core[3] && n == Some(plot.core[5])) {
                     put(face_box(c, side, WALL, 0.0, C, top + DOOR_H, hut), concrete(0.75), true);
                     continue;
                 }
