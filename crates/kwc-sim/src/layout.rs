@@ -17,7 +17,7 @@ use std::collections::{BinaryHeap, HashMap, VecDeque};
 /// Minimum plot size in cells (~27 m²); smaller leftovers merge or become wells.
 const MIN_PLOT: usize = 12;
 /// How far (cells, through rooms) a room may sit from a corridor or stair.
-const ROOM_REACH: u32 = 6;
+const ROOM_REACH: u32 = 7;
 
 pub fn build(params: &Params) -> City {
     let site = Site::load();
@@ -504,13 +504,13 @@ fn make_plots(city: &mut City) {
 }
 
 /// BFS within one plot from `from`, never entering `block` (the stair shaft).
-fn bfs_in_plot(city: &City, pid: u32, from: &[Cell], block: Option<Cell>) -> (HashMap<Cell, u32>, HashMap<Cell, Cell>) {
+fn bfs_in_plot(city: &City, pid: u32, from: &[Cell], block: &[Cell]) -> (HashMap<Cell, u32>, HashMap<Cell, Cell>) {
     let mut depth: HashMap<Cell, u32> = from.iter().map(|&c| (c, 0)).collect();
     let mut parent = HashMap::new();
     let mut q: VecDeque<Cell> = from.iter().copied().collect();
     while let Some(c) = q.pop_front() {
         for (_, n) in city.neighbours(c) {
-            if city.plot_of[city.idx(n)] == pid && Some(n) != block && !depth.contains_key(&n) {
+            if city.plot_of[city.idx(n)] == pid && !block.contains(&n) && !depth.contains_key(&n) {
                 depth.insert(n, depth[&c] + 1);
                 parent.insert(n, c);
                 q.push_back(n);
@@ -528,28 +528,38 @@ fn lay_out_circulation(city: &mut City, p: usize, rng: &mut impl Rng) -> bool {
     let cells = city.plots[p].cells.clone();
     let pid = p as u32;
 
-    let mut best: Option<(u32, Cell, Cell)> = None;
+    // The stair is a 2 x 2 cell block (3 x 3 m) beside the landing: the landing
+    // opens onto the block's near-A cell; flights run away from it (A) and back (B).
+    let mut best: Option<(u32, Cell, [Cell; 4])> = None;
     let mut cands: Vec<Cell> = cells.iter().copied().filter(|&c| touches_alley(city, c)).collect();
     cands.shuffle(rng);
     for (tried, &c) in cands.iter().enumerate() {
-        if tried >= 12 && best.is_some() {
+        if tried >= 16 && best.is_some() {
             break;
         }
-        for (_, n) in city.neighbours(c) {
-            if city.plot_of[city.idx(n)] != pid {
-                continue;
-            }
-            let (depth, _) = bfs_in_plot(city, pid, &[c], Some(n));
-            if depth.len() + 1 < cells.len() {
-                continue; // the stair shaft would cut the plot in two
-            }
-            let m = *depth.values().max().unwrap();
-            if best.map_or(true, |b| m < b.0) {
-                best = Some((m, c, n));
+        for (d, na) in city.neighbours(c) {
+            for side in [Dir::N, Dir::E, Dir::S, Dir::W] {
+                if side == d || side == opposite(d) {
+                    continue;
+                }
+                let (Some(fa), Some(nb)) = (city.step(na, d), city.step(na, side)) else { continue };
+                let Some(fb) = city.step(nb, d) else { continue };
+                let block = [na, fa, nb, fb];
+                if block.iter().any(|&x| city.plot_of[city.idx(x)] != pid || x == c) {
+                    continue;
+                }
+                let (depth, _) = bfs_in_plot(city, pid, &[c], &block);
+                if depth.len() + 4 < cells.len() {
+                    continue; // the stairwell would cut the plot in two
+                }
+                let m = *depth.values().max().unwrap();
+                if best.map_or(true, |b| m < b.0) {
+                    best = Some((m, c, block));
+                }
             }
         }
     }
-    let Some((_, landing, stair)) = best else { return false };
+    let Some((_, landing, block)) = best else { return false };
 
     for &c in &cells {
         let k = city.idx(c);
@@ -558,14 +568,16 @@ fn lay_out_circulation(city: &mut City, p: usize, rng: &mut impl Rng) -> bool {
     }
     let k = city.idx(landing);
     city.role[k] = Role::Core;
-    let k = city.idx(stair);
-    city.role[k] = Role::Stair;
-    city.plots[p].core = vec![landing, stair];
+    for x in block {
+        let k = city.idx(x);
+        city.role[k] = Role::Stair;
+    }
+    city.plots[p].core = vec![landing, block[0], block[1], block[2], block[3]];
 
     // Every floor gets its own corridors: buildings were fitted out (and
     // re-partitioned) floor by floor, so no two storeys need look the same.
     for f in 0..MAX_FLOORS as u8 {
-        lay_out_floor(city, pid, &cells, landing, stair, f, rng);
+        lay_out_floor(city, pid, &cells, landing, f, rng);
     }
     true
 }
@@ -574,7 +586,7 @@ fn lay_out_circulation(city: &mut City, p: usize, rng: &mut impl Rng) -> bool {
 /// circulation extends a corridor towards it along a (per-floor random) BFS
 /// tree, stopping once it touches existing circulation. Then a few dead-end
 /// stubs wander off, as corridors in the Walled City did.
-fn lay_out_floor(city: &mut City, pid: u32, cells: &[Cell], landing: Cell, stair: Cell, f: u8, rng: &mut impl Rng) {
+fn lay_out_floor(city: &mut City, pid: u32, cells: &[Cell], landing: Cell, f: u8, rng: &mut impl Rng) {
     // Randomised BFS tree from the landing.
     let mut depth: HashMap<Cell, u32> = HashMap::from([(landing, 0)]);
     let mut parent: HashMap<Cell, Cell> = HashMap::new();
@@ -583,7 +595,7 @@ fn lay_out_floor(city: &mut City, pid: u32, cells: &[Cell], landing: Cell, stair
         let mut ns: Vec<Cell> = city.neighbours(c).map(|x| x.1).collect();
         ns.shuffle(rng);
         for n in ns {
-            if city.plot_of[city.idx(n)] == pid && n != stair && !depth.contains_key(&n) {
+            if city.plot_of[city.idx(n)] == pid && city.role_at(n) != Role::Stair && !depth.contains_key(&n) {
                 depth.insert(n, depth[&c] + 1);
                 parent.insert(n, c);
                 q.push_back(n);
@@ -593,7 +605,7 @@ fn lay_out_floor(city: &mut City, pid: u32, cells: &[Cell], landing: Cell, stair
     let circ = |city: &City, x: Cell| city.circ_at(x, pid, f);
     let room = |city: &City, x: Cell| city.room_at(x, pid, f);
     // Room-distance from `c` to a room touching circulation (None if > reach).
-    let reach_limit = rng.gen_range(4..=ROOM_REACH);
+    let reach_limit = rng.gen_range(5..=ROOM_REACH);
     let reach = |city: &City, c: Cell| -> Option<u32> {
         let mut seen = HashMap::from([(c, 0u32)]);
         let mut q = VecDeque::from([c]);
@@ -656,4 +668,13 @@ fn lay_out_floor(city: &mut City, pid: u32, cells: &[Cell], landing: Cell, stair
 
 fn path_to_alley(city: &City, noise: &[f32], from: Cell) -> Option<Vec<Cell>> {
     noisy_path(city, noise, from, &|c| city.ground_at(c) == Ground::Alley)
+}
+
+fn opposite(d: Dir) -> Dir {
+    match d {
+        Dir::N => Dir::S,
+        Dir::S => Dir::N,
+        Dir::E => Dir::W,
+        Dir::W => Dir::E,
+    }
 }

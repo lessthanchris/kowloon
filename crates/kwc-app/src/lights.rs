@@ -46,6 +46,15 @@ pub fn tube_box(c: Cell, f: i32) -> Aabb {
 }
 
 pub const TUBE_COL: [f32; 3] = [0.62, 1.0, 0.74];
+pub const BULB_COL: [f32; 3] = [1.0, 0.55, 0.25];
+
+/// The bulb over a stair's turning landing on floor `f`, if it works.
+pub fn stair_bulb(plot: &Plot, f: i32) -> Option<Aabb> {
+    let w = crate::world::Well::of(plot);
+    let p = w.point(2.9, 1.5);
+    let y = f as f32 * S + S / 2.0 + 2.1;
+    (hash(plot.id, f as u32, 77) < 0.8).then(|| Aabb::new(Vec3::new(p.x - 0.08, y, p.z - 0.08), Vec3::new(p.x + 0.08, y + 0.14, p.z + 0.08)))
+}
 
 const SIGN_COLS: &[[u8; 3]] = &[[255, 60, 70], [255, 90, 180], [80, 255, 140], [70, 220, 255], [255, 190, 60], [240, 240, 255]];
 
@@ -160,6 +169,11 @@ fn neighbours(city: &City, year: u16, links: &HashMap<Space, Vec<Space>>, s: Spa
                 for f in 0..city.height_at(c, year) {
                     v.push((plot.core[0], f));
                 }
+                for &o in &plot.core[1..] {
+                    if o != c {
+                        v.push((o, OPEN));
+                    }
+                }
             }
             Ground::Plot => {}
             _ => {
@@ -206,6 +220,14 @@ pub fn collect(city: &City, year: u16) -> Vec<PointLight> {
                     let b = tube_box(c, f);
                     lights.push(PointLight { pos: (b.min + b.max) * 0.5 - Vec3::Y * 0.1, col: lin(TUBE_COL) * 0.9, range: 3.6 });
                 }
+            }
+        }
+    }
+    // Bare bulbs over the stairs' turning landings.
+    for p in city.plots.iter().filter(|p| p.height_at(year) > 0) {
+        for f in 0..p.height_at(year) as i32 {
+            if let Some(b) = stair_bulb(p, f) {
+                lights.push(PointLight { pos: (b.min + b.max) * 0.5 - Vec3::Y * 0.2, col: lin(BULB_COL) * 1.1, range: 4.5 });
             }
         }
     }

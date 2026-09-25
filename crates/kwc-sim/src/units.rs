@@ -79,7 +79,7 @@ fn floor_units(city: &City, p: usize, floor: u8, rng: &mut impl Rng, out: &mut V
     }
 
     // Pokey leftovers (under ~18 m²) knock through into their smallest neighbour.
-    const MIN_UNIT: usize = 12;
+    const MIN_UNIT: usize = 14;
     let mut lonely = std::collections::HashSet::new();
     while let Some(g) = (0..groups.len()).find(|&g| !groups[g].is_empty() && groups[g].len() < MIN_UNIT && !lonely.contains(&g)) {
         let mut best: Option<usize> = None;

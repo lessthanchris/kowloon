@@ -15,10 +15,13 @@ const C: f32 = CELL_M;
 pub const SLAB: f32 = 0.2;
 /// Partition wall thickness.
 const WALL: f32 = 0.1;
-/// Stair: five risers per half-flight, half a storey each flight.
-const RISERS: usize = 5;
-/// Length of each half-flight run; the rest of the cell is the turning landing.
-const RUN: f32 = 1.15;
+/// Stair: eight risers per half-flight (17.5 cm), half a storey each flight.
+const RISERS: usize = 8;
+/// Stairwell plan (a 3 x 3 m block): a strip at floor level by the landing, the
+/// flights' run, and the turning landing at the far end.
+const NEAR: f32 = 0.45;
+const RUN: f32 = 1.95;
+const WELL: f32 = 2.0 * C;
 const PARAPET: f32 = 1.0;
 const DOOR_W: f32 = 0.95;
 const DOOR_H: f32 = 2.1;
@@ -156,24 +159,31 @@ fn nudge(a: &mut Aabb, d: Dir, amount: f32) {
     a.max += v;
 }
 
-/// Local stair coordinates: `u` runs from the landing edge into the stair cell,
-/// `v` across it.
-fn stair_box(c: Cell, to_landing: Dir, u0: f32, u1: f32, v0: f32, v1: f32, y0: f32, y1: f32) -> Aabb {
-    let (x0, z0, x1, z1) = cell_rect(c);
-    let (a, b) = match to_landing {
-        Dir::E => (Vec3::new(x1 - u1, y0, z0 + v0), Vec3::new(x1 - u0, y1, z0 + v1)),
-        Dir::W => (Vec3::new(x0 + u0, y0, z0 + v0), Vec3::new(x0 + u1, y1, z0 + v1)),
-        Dir::S => (Vec3::new(x0 + v0, y0, z1 - u1), Vec3::new(x0 + v1, y1, z1 - u0)),
-        Dir::N => (Vec3::new(x0 + v0, y0, z0 + u0), Vec3::new(x0 + v1, y1, z0 + u1)),
-    };
-    Aabb::new(a, b)
+/// Stairwell frame: `u` runs from the landing's edge into the well, `v` across
+/// it from the A flight's side (0..1.5 m) to the B flight's (1.5..3 m).
+pub struct Well {
+    origin: Vec3,
+    u: Vec3,
+    v: Vec3,
 }
 
-/// World (x, z) of a point in a stair cell's local coordinates (see `stair_box`).
-#[cfg_attr(not(test), allow(dead_code))]
-pub fn stair_point(c: Cell, to_landing: Dir, u: f32, v: f32) -> (f32, f32) {
-    let b = stair_box(c, to_landing, u, u, v, v, 0.0, 0.0);
-    (b.min.x, b.min.z)
+impl Well {
+    pub fn of(plot: &Plot) -> Well {
+        let (na, nb) = (plot.core[1], plot.core[3]);
+        let du = dir_between(plot.core[0], na).expect("landing beside the stair").delta();
+        let dv = dir_between(na, nb).expect("stairwell is 2 x 2").delta();
+        let u = Vec3::new(du.0 as f32, 0.0, du.1 as f32);
+        let v = Vec3::new(dv.0 as f32, 0.0, dv.1 as f32);
+        let centre = Vec3::new((na.0 as f32 + 0.5) * C, 0.0, (na.1 as f32 + 0.5) * C);
+        Well { origin: centre - (u + v) * (C / 2.0), u, v }
+    }
+    pub fn point(&self, u: f32, v: f32) -> Vec3 {
+        self.origin + self.u * u + self.v * v
+    }
+    fn bx(&self, u0: f32, u1: f32, v0: f32, v1: f32, y0: f32, y1: f32) -> Aabb {
+        let (a, b) = (self.point(u0, v0), self.point(u1, v1));
+        Aabb::new(Vec3::new(a.x, y0, a.z), Vec3::new(b.x, y1, b.z))
+    }
 }
 
 pub fn landing_dir(plot: &Plot) -> Dir {
@@ -318,7 +328,9 @@ pub fn build(city: &City, year: u16) -> (WalkWorld, MeshData) {
                     let pid = city.plot_of[city.idx(c)];
                     let plot = &city.plots[pid as usize];
                     if city.role_at(c) == Role::Stair {
-                        stair_cell(&mut b, city, c, plot, h);
+                        if c == plot.core[1] {
+                            stairwell(&mut b, city, plot, h);
+                        }
                         continue;
                     }
                     // Storey by storey: runs of rooms are solid; circulation is hollow.
@@ -375,6 +387,27 @@ pub fn lane_view(city: &City, lane: Option<&Lane>, k: usize) -> Option<(Vec3, f3
     Some((p(a), d.z.atan2(d.x)))
 }
 
+/// Corner posts. Where a space turns a corner (both neighbours at a corner are
+/// open but the diagonal cell is walled off), the two walls end short of each
+/// other; a WALL x WALL post in this cell's corner closes the joint.
+fn corner_posts(b: &mut Builder, c: Cell, y0: f32, y1: f32, col: [f32; 3], open: &dyn Fn(Cell) -> bool, city: &City) {
+    let (x0, z0, x1, z1) = cell_rect(c);
+    for (dx, dz) in [(-1i32, -1i32), (1, -1), (-1, 1), (1, 1)] {
+        let (i, j) = (c.0 as i32, c.1 as i32);
+        let at = |di: i32, dj: i32| {
+            let (a, bb) = (i + di, j + dj);
+            city.in_bounds(a, bb).then(|| (a as u16, bb as u16))
+        };
+        let (Some(n1), Some(n2)) = (at(dx, 0), at(0, dz)) else { continue };
+        let diag_open = at(dx, dz).is_some_and(|d| open(d));
+        if open(n1) && open(n2) && !diag_open {
+            let x = if dx < 0 { (x0, x0 + WALL) } else { (x1 - WALL, x1) };
+            let z = if dz < 0 { (z0, z0 + WALL) } else { (z1 - WALL, z1) };
+            b.solid(Aabb::new(Vec3::new(x.0, y0, z.0), Vec3::new(x.1, y1, z.1)), col, SIDES);
+        }
+    }
+}
+
 /// Everything but the face towards `d`: walls against a facade or a neighbour's
 /// wall don't draw their outer side (it would fight with that surface).
 fn except(d: Dir) -> Faces {
@@ -406,6 +439,8 @@ fn circulation_storey(b: &mut Builder, city: &City, c: Cell, pid: u32, f: i32, h
     }
     let (y0, y1) = (y, y + S - SLAB);
     let col = paint(pid, f);
+    let same_space = |n: Cell| city.circ_at(n, pid, fl) || (landing && city.role_at(n) == Role::Stair && city.plot_of[city.idx(n)] == pid);
+    corner_posts(b, c, y0, y1, col, &same_space, city);
     for d in Dir::ALL {
         let n = city.step(c, d);
         let open = n.is_some_and(|n| {
@@ -415,8 +450,9 @@ fn circulation_storey(b: &mut Builder, city: &City, c: Cell, pid: u32, f: i32, h
             continue;
         }
         if n.is_some_and(|n| city.room_at(n, pid, fl)) {
-            // A flat's wall (the flat itself is a solid block).
-            b.visual(face_box(c, d, 0.0, 0.0, C, y0, y1), col, 0.0, only(opposite(d)));
+            // A flat's wall: same thickness and plane as every other corridor wall,
+            // so corners meet cleanly.
+            b.solid(face_box(c, d, WALL, 0.0, C, y0, y1), col, except(d));
             continue;
         }
         let lane = n.is_some_and(|n| city.ground_at(n) == Ground::Alley);
@@ -433,38 +469,53 @@ fn circulation_storey(b: &mut Builder, city: &City, c: Cell, pid: u32, f: i32, h
     b.mesh.ao = 1.0;
 }
 
-fn stair_cell(b: &mut Builder, city: &City, c: Cell, plot: &Plot, h: i32) {
-    let landing = plot.core[0];
-    let to_landing = dir_between(c, landing).expect("stair beside its landing");
+/// A dog-leg stair in a 3 x 3 m well: from the floor-level strip by the landing,
+/// flight A climbs half a storey away from it, turns on the far landing, and
+/// flight B climbs back to the strip one storey up.
+fn stairwell(b: &mut Builder, city: &City, plot: &Plot, h: i32) {
+    let w = Well::of(plot);
     let rise = S / 2.0 / RISERS as f32;
     let tread = RUN / RISERS as f32;
-    let half = C / 2.0;
-    let step_col = concrete(0.9);
+    let half = WELL / 2.0;
+    // Terrazzo treads and painted walls: pale enough to catch the bulbs.
+    let step_col = srgb(150, 146, 136);
+    let wall_col = paint(plot.id, 7);
     b.mesh.ao = 0.12;
+    // Floor-level strip by the landing on every floor, the roof (inside the hut)
+    // included; the ground floor's is the ground.
+    for f in 1..=h {
+        let y = f as f32 * S;
+        b.solid(w.bx(0.0, NEAR, 0.0, WELL, y - 0.3, y), step_col, ALL);
+    }
     for f in 0..h {
         let y = f as f32 * S;
         for k in 1..=RISERS {
-            // Up the first half-flight, away from the landing...
-            let ta = y + k as f32 * rise;
-            let (u0, u1) = ((k - 1) as f32 * tread, k as f32 * tread);
-            b.solid(stair_box(c, to_landing, u0, u1, 0.0, half, ta - 0.3, ta), step_col, ALL);
-            // ...and back up the second, towards the landing one storey higher.
-            let tb = y + S / 2.0 + k as f32 * rise;
-            let (u0, u1) = (RUN - k as f32 * tread, RUN - (k - 1) as f32 * tread);
-            b.solid(stair_box(c, to_landing, u0, u1, half, C, tb - 0.3, tb), step_col, ALL);
+            let kf = k as f32;
+            let ta = y + kf * rise;
+            b.solid(w.bx(NEAR + (kf - 1.0) * tread, NEAR + kf * tread, 0.0, half, ta - 0.3, ta), step_col, ALL);
+            let tb = y + S / 2.0 + kf * rise;
+            b.solid(w.bx(NEAR + RUN - kf * tread, NEAR + RUN - (kf - 1.0) * tread, half, WELL, tb - 0.3, tb), step_col, ALL);
         }
-        // Turning landing at the far end.
         let tl = y + S / 2.0;
-        b.solid(stair_box(c, to_landing, RUN, C, 0.0, C, tl - 0.3, tl), step_col, ALL);
-        // A handrail-high divider between the flights (visual).
-        b.visual(stair_box(c, to_landing, 0.0, RUN, half - 0.03, half + 0.03, y, y + S * 0.5 + 1.0), concrete(0.5), 0.0, SIDES);
+        b.solid(w.bx(NEAR + RUN, WELL, 0.0, WELL, tl - 0.3, tl), step_col, ALL);
+        // Handrail between the flights (visual).
+        b.visual(w.bx(NEAR, NEAR + RUN, half - 0.03, half + 0.03, y, y + S * 0.5 + 1.0), concrete(0.5), 0.0, SIDES);
+        if let Some(bulb) = crate::lights::stair_bulb(plot, f) {
+            b.visual(bulb, crate::lights::BULB_COL, 2.5, ALL);
+        }
     }
-    // Shaft walls on every side but the landing's (the hut above is roof furniture).
+    // Walls round the well, open only to the landing.
     let top = h as f32 * S;
-    let _ = city;
-    for d in Dir::ALL {
-        if d != to_landing {
-            b.solid(face_box(c, d, WALL, 0.0, C, 0.0, top), concrete(0.75), except(d));
+    let cells = &plot.core[1..5];
+    let in_well = |n: Cell| cells.contains(&n) || n == plot.core[0];
+    corner_posts(b, plot.core[1], 0.0, top, wall_col, &in_well, city);
+    for &c in cells {
+        for d in Dir::ALL {
+            let n = city.step(c, d);
+            if n.is_some_and(|n| cells.contains(&n) || n == plot.core[0] && c == plot.core[1]) {
+                continue;
+            }
+            b.solid(face_box(c, d, WALL, 0.0, C, 0.0, top), wall_col, except(d));
         }
     }
     b.mesh.ao = 1.0;
@@ -491,7 +542,7 @@ fn unit_doors(b: &mut Builder, city: &City, year: u16) {
             }
         } else {
             b.mesh.ao = 0.12;
-            let door = face_box_out(c, d, 0.04, a0, a1, y, y + DOOR_H);
+            let door = face_box_out(c, d, WALL + 0.03, a0, a1, y, y + DOOR_H);
             if u.door_state == DoorState::Open {
                 b.visual(door, srgb(255, 200, 150), 0.7, only(d));
             } else {
@@ -547,26 +598,33 @@ pub fn roof_furniture(city: &City, year: u16) -> (Vec<Piece>, Vec<Ladder>) {
     let mut put = |aabb: Aabb, col: [f32; 3], solid: bool| out.push(Piece { aabb, col, faces: ALL, solid });
     let wood = srgb(150, 120, 80);
 
-    // Stair huts.
+    // Stair huts over the wells.
     for plot in &city.plots {
         let h = plot.height_at(year);
         if h == 0 {
             continue;
         }
-        let (c, d) = (plot.core[1], landing_dir(plot));
         let top = h as f32 * S;
         let hut = top + 2.4;
-        let (x0, z0, x1, z1) = cell_rect(c);
-        for side in Dir::ALL {
-            if side != d {
+        let cells = &plot.core[1..5];
+        for &c in cells {
+            for side in Dir::ALL {
+                let n = city.step(c, side);
+                if n.is_some_and(|n| cells.contains(&n)) {
+                    continue;
+                }
+                if c == plot.core[1] && n == Some(plot.core[0]) {
+                    put(face_box(c, side, WALL, 0.0, C, top + DOOR_H, hut), concrete(0.75), true);
+                    continue;
+                }
                 // Inset a touch so it never shares a plane with a taller neighbour's wall.
                 let mut w = face_box(c, side, WALL, 0.0, C, top, hut);
                 nudge(&mut w, side, -0.03);
                 put(w, concrete(0.75), true);
             }
+            let (x0, z0, x1, z1) = cell_rect(c);
+            put(Aabb::new(Vec3::new(x0, hut, z0), Vec3::new(x1, hut + 0.15, z1)), concrete(0.7), true);
         }
-        put(face_box(c, d, WALL, 0.0, C, top + DOOR_H, hut), concrete(0.75), true);
-        put(Aabb::new(Vec3::new(x0, hut, z0), Vec3::new(x1, hut + 0.15, z1)), concrete(0.7), true);
     }
 
     // One ladder per pair of neighbouring roofs of different heights.

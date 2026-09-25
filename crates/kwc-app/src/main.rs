@@ -427,6 +427,14 @@ fn screenshot(args: &[String], out: &str) {
             p.pos = Vec3::new((l.0 as f32 + 0.5) * CELL_M, f * STOREY_M, (l.1 as f32 + 0.5) * CELL_M) + back;
             p.yaw = (-d.1 as f32).atan2(-d.0 as f32);
             p.pitch = arg::<f32>(args, "--pitch").unwrap_or(0.0);
+            if args.iter().any(|a| a == "--in-well") {
+                // Stand on the turning landing, looking back down both flights.
+                let w = world::Well::of(plot);
+                let at = w.point(2.75, 1.5);
+                let back = w.point(0.0, 1.5) - at;
+                p.pos = Vec3::new(at.x, f * STOREY_M + STOREY_M / 2.0, at.z);
+                p.yaw = back.z.atan2(back.x);
+            }
             println!("plot {} height {h} floor {f}", plot.id);
         }
         if let Some(v) = arg::<String>(args, "--at").map(|v| floats(&v)) {
@@ -523,15 +531,18 @@ mod tests {
         let (w, _) = world::build(&city, END_YEAR);
         let plot = city.plots.iter().find(|p| p.final_height() >= 12).unwrap();
         let h = plot.final_height() as i32;
-        let (landing, stair) = (plot.core[0], plot.core[1]);
-        let d = world::landing_dir(plot);
+        let landing = plot.core[0];
+        let well = world::Well::of(plot);
         let lc = ((landing.0 as f32 + 0.5) * CELL_M, (landing.1 as f32 + 0.5) * CELL_M);
         let mut p = player::Player::new(Vec3::new(lc.0, 0.0, lc.1), 0.0);
         settle(&mut p, &w);
         assert!(p.pos.y.abs() < 0.05, "should stand on the ground-floor landing, y = {}", p.pos.y);
         for floor in 1..=h {
-            let pt = |u: f32, v: f32| world::stair_point(stair, d, u, v);
-            let route = [pt(0.05, 0.4), pt(1.15, 0.4), pt(1.15, 1.1), pt(0.05, 1.1), lc];
+            let pt = |u: f32, v: f32| {
+                let p = well.point(u, v);
+                (p.x, p.z)
+            };
+            let route = [pt(0.25, 0.75), pt(2.7, 0.75), pt(2.7, 2.25), pt(0.25, 2.25), pt(0.25, 0.75), lc];
             assert!(walk_to(&mut p, &w, &route), "stuck on the stair to floor {floor} at {:?}", p.pos);
             assert!((p.pos.y - floor as f32 * STOREY_M).abs() < 0.1, "floor {floor}: y = {}", p.pos.y);
         }
