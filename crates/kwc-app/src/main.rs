@@ -6,6 +6,7 @@
 //!                                 render one frame headless and save it
 
 mod citymesh;
+mod game;
 mod lighting;
 mod lights;
 mod player;
@@ -40,13 +41,16 @@ struct Settings {
 
 struct World {
     city: City,
+    society: society::Society,
     mesh: Option<GpuMesh>,
     built_for: Option<(u16, ColourMode, u64)>,
 }
 
 impl World {
     fn new(seed: u64) -> World {
-        World { city: generate(&Params { seed, ..Default::default() }), mesh: None, built_for: None }
+        let city = generate(&Params { seed, ..Default::default() });
+        let society = society::generate(&city);
+        World { city, society, mesh: None, built_for: None }
     }
     fn ensure_mesh(&mut self, gpu: &Gpu, year: u16, mode: ColourMode) {
         let key = (year, mode, self.city.params.seed);
@@ -69,6 +73,7 @@ struct Walk {
     interior: Vec<GpuMesh>,
     player: player::Player,
     year: u16,
+    spots: Vec<game::Spot>,
 }
 
 impl Walk {
@@ -79,7 +84,7 @@ impl Walk {
         lights::bake(city, year, &lamps, &mut [&mut mesh]);
         log::info!("walk world {year}: {} boxes, {} verts in {:.0?}", world.boxes.len(), mesh.vertices.len(), t.elapsed());
         let player = player::Player::new(world.spawn, world.spawn_yaw);
-        Walk { interior: GpuMesh::upload_chunked(&gpu.device, &mesh), world, player, year }
+        Walk { interior: GpuMesh::upload_chunked(&gpu.device, &mesh), world, player, year, spots: game::spots(city, year) }
     }
 }
 
@@ -114,6 +119,8 @@ struct App {
     settings: Settings,
     orbit: OrbitCamera,
     walk: Option<Walk>,
+    /// The delivery game (None = free roaming).
+    game: Option<game::Game>,
     keys: HashSet<KeyCode>,
     drag: Option<MouseButton>,
     last_cursor: Option<(f64, f64)>,
@@ -168,6 +175,7 @@ impl ApplicationHandler for App {
                             KeyCode::Escape if walking => self.leave_walk(),
                             KeyCode::KeyT => self.settings.torch = !self.settings.torch,
                             KeyCode::KeyN => self.settings.night = !self.settings.night,
+                            KeyCode::KeyE if walking => self.interact(),
                             _ => {}
                         }
                     }
@@ -215,9 +223,14 @@ impl ApplicationHandler for App {
 }
 
 impl App {
+    fn interact(&mut self) {
+        let (Some(g), Some(w)) = (self.game.as_mut(), self.walk.as_ref()) else { return };
+        g.interact(&self.world.city, &self.world.society, &w.spots, w.player.pos);
+    }
+
     fn enter_walk(&mut self) {
         let run = self.run.as_ref().unwrap();
-        let year = self.settings.year.floor() as u16;
+        let year = self.game.as_ref().map_or(self.settings.year.floor() as u16, |g| g.year);
         self.settings.playing = false;
         self.walk = Some(Walk::new(&run.gpu, &self.world.city, year));
         let w = &run.window;
@@ -262,6 +275,12 @@ impl App {
         if let Some(w) = self.walk.as_mut() {
             w.player.update(&w.world, input, dt);
         }
+        if let Some(g) = self.game.as_mut() {
+            g.tick(dt);
+            if g.job.is_none() {
+                g.new_job(&self.world.city, &self.world.society);
+            }
+        }
 
         let s = &mut self.settings;
         if s.playing {
@@ -301,9 +320,11 @@ impl App {
         let stats = stats::measure(&self.world.city, year);
         let fps = self.fps;
         let walk = self.walk.as_ref();
-        let cmds = run.gui.draw(&run.gpu, &run.window, &mut enc, &view, |ui| match walk {
-            Some(w) => hud(ui, w, s, fps),
-            None => panel(ui, s, &stats, fps),
+        let info = walk.map(|w| hud_info(&self.world, w, self.game.as_ref(), &params));
+        let game = self.game.as_ref();
+        let cmds = run.gui.draw(&run.gpu, &run.window, &mut enc, &view, |ui| match (walk, &info) {
+            (Some(w), Some(info)) => hud(ui, w, s, game, info, fps),
+            _ => panel(ui, s, &stats, fps),
         });
         run.gpu.queue.submit(cmds.into_iter().chain([enc.finish()]));
         run.window.pre_present_notify();
@@ -311,19 +332,174 @@ impl App {
     }
 }
 
-fn hud(ui: &mut egui::Ui, w: &Walk, s: &Settings, fps: f32) {
-    let p = &w.player;
-    let floor = (p.pos.y / world::S + 0.25).floor() as i32;
-    let place = if p.pos.y < 0.5 { "street level".to_string() } else { format!("floor {floor}") };
-    egui::Area::new(egui::Id::new("hud")).fixed_pos([16.0, 16.0]).show(ui.ctx(), |ui| {
-        egui::Frame::new().fill(egui::Color32::from_black_alpha(150)).inner_margin(8.0).corner_radius(4.0).show(ui, |ui| {
-            ui.colored_label(egui::Color32::from_rgb(230, 225, 210), format!("{} · {}", w.year, place));
-            ui.small(format!(
-                "WASD walk · Shift run · Space jump · W on a ladder to climb · T torch ({}) · N night · Tab/Esc overview · {fps:.0} fps",
-                if s.torch { "on" } else { "off" }
-            ));
+/// A name floating over a door, already projected to the screen.
+struct Label {
+    ndc: (f32, f32),
+    title: String,
+    sub: String,
+    /// "COLLECT" / "DELIVER" if it's where the job wants you.
+    tag: Option<&'static str>,
+    fade: f32,
+}
+
+struct HudInfo {
+    place: String,
+    labels: Vec<Label>,
+    /// Addresses for the job card.
+    from_addr: String,
+    to_addr: String,
+}
+
+/// Work out what the HUD shows this frame: where you are, and the names of
+/// the doors you can see nearby.
+fn hud_info(wd: &World, w: &Walk, g: Option<&game::Game>, params: &FrameParams) -> HudInfo {
+    let (city, soc, year) = (&wd.city, &wd.society, w.year);
+    let cam = w.player.camera();
+    let look = (cam.target - cam.eye).normalize();
+    let job_unit = |u: u32| -> Option<&'static str> {
+        let job = g?.job.as_ref()?;
+        if !job.picked && job.from == u {
+            Some("COLLECT")
+        } else if job.picked && job.to == u {
+            Some("DELIVER")
+        } else {
+            None
+        }
+    };
+    let mut cands: Vec<(f32, &game::Spot)> = w
+        .spots
+        .iter()
+        .filter_map(|sp| {
+            let d = sp.label - cam.eye;
+            let dist = d.length();
+            let tagged = matches!(sp.kind, game::SpotKind::Unit(u) if job_unit(u).is_some());
+            let range = if tagged { 25.0 } else { 9.0 };
+            (dist < range && d.normalize().dot(look) > 0.3 && (sp.label.y - cam.eye.y).abs() < 3.5).then_some((dist, sp))
+        })
+        .collect();
+    cands.sort_by(|a, b| a.0.total_cmp(&b.0));
+    let mut labels = vec![];
+    for (dist, sp) in cands {
+        if labels.len() >= 7 {
+            break;
+        }
+        let back = (sp.label - cam.eye).normalize() * 0.2;
+        if !game::line_clear(&w.world, cam.eye, sp.label - back) {
+            continue;
+        }
+        let clip = params.view_proj * sp.label.extend(1.0);
+        if clip.w <= 0.0 {
+            continue;
+        }
+        let (title, sub) = game::describe(city, soc, year, sp.kind);
+        let tag = match sp.kind {
+            game::SpotKind::Unit(u) => job_unit(u),
+            _ => None,
+        };
+        labels.push(Label { ndc: (clip.x / clip.w, clip.y / clip.w), title, sub, tag, fade: (1.0 - (dist - 5.0).max(0.0) / 4.0).clamp(0.35, 1.0) });
+    }
+    let addr = |u: u32| soc.directory.address[u as usize].line();
+    let (from_addr, to_addr) = g.and_then(|g| g.job.as_ref()).map_or((String::new(), String::new()), |j| (addr(j.from), addr(j.to)));
+    HudInfo { place: game::place_name(city, soc, year, w.player.pos), labels, from_addr, to_addr }
+}
+
+fn hud(ui: &mut egui::Ui, w: &Walk, s: &Settings, g: Option<&game::Game>, info: &HudInfo, fps: f32) {
+    use egui::{Align2, Color32, FontId, Pos2, Stroke};
+    let screen = ui.max_rect();
+    let painter = ui.ctx().layer_painter(egui::LayerId::new(egui::Order::Background, egui::Id::new("labels")));
+    let paper = Color32::from_rgb(236, 228, 208);
+
+    // Door and entrance names.
+    for l in &info.labels {
+        let pos = Pos2::new(screen.left() + (l.ndc.0 * 0.5 + 0.5) * screen.width(), screen.top() + (0.5 - l.ndc.1 * 0.5) * screen.height());
+        let a = (l.fade * 255.0) as u8;
+        let (accent, bg) = match l.tag {
+            Some("COLLECT") => (Color32::from_rgb(120, 230, 150), Color32::from_rgba_unmultiplied(20, 60, 30, 210)),
+            Some(_) => (Color32::from_rgb(255, 200, 90), Color32::from_rgba_unmultiplied(70, 45, 10, 210)),
+            None => (Color32::from_rgba_unmultiplied(236, 228, 208, a), Color32::from_rgba_unmultiplied(12, 12, 14, (a as f32 * 0.7) as u8)),
+        };
+        let title = painter.layout_no_wrap(l.title.clone(), FontId::proportional(15.0), accent);
+        let sub = painter.layout_no_wrap(l.sub.clone(), FontId::proportional(11.5), Color32::from_rgba_unmultiplied(200, 195, 180, a));
+        let tag = l.tag.map(|t| painter.layout_no_wrap(t.to_string(), FontId::monospace(11.0), accent));
+        let w_ = title.size().x.max(sub.size().x).max(tag.as_ref().map_or(0.0, |t| t.size().x));
+        let h = title.size().y + sub.size().y + tag.as_ref().map_or(0.0, |t| t.size().y + 2.0);
+        let rect = egui::Rect::from_center_size(pos, egui::vec2(w_ + 14.0, h + 8.0));
+        painter.rect_filled(rect, 3.0, bg);
+        if l.tag.is_some() {
+            painter.rect_stroke(rect, 3.0, Stroke::new(1.5, accent), egui::StrokeKind::Outside);
+        }
+        let mut y = rect.top() + 4.0;
+        if let Some(t) = tag {
+            let ts = t.size();
+            painter.galley(Pos2::new(pos.x - ts.x / 2.0, y), t, accent);
+            y += ts.y + 2.0;
+        }
+        let ts = title.size();
+        painter.galley(Pos2::new(pos.x - ts.x / 2.0, y), title, accent);
+        y += ts.y;
+        let ss = sub.size();
+        painter.galley(Pos2::new(pos.x - ss.x / 2.0, y), sub, paper);
+    }
+
+    // Where you are.
+    painter.text(
+        Pos2::new(screen.center().x, screen.top() + 22.0),
+        Align2::CENTER_CENTER,
+        &info.place,
+        FontId::proportional(20.0),
+        Color32::from_rgba_unmultiplied(236, 228, 208, 230),
+    );
+    // Crosshair.
+    painter.circle_filled(screen.center(), 2.0, Color32::from_white_alpha(140));
+
+    // The job card.
+    if let Some(g) = g {
+        egui::Area::new(egui::Id::new("job")).anchor(Align2::RIGHT_TOP, [-16.0, 16.0]).show(ui.ctx(), |ui| {
+            egui::Frame::new().fill(Color32::from_rgba_unmultiplied(20, 18, 16, 225)).inner_margin(12.0).corner_radius(4.0).show(ui, |ui| {
+                ui.set_max_width(360.0);
+                ui.colored_label(paper, egui::RichText::new(format!("{} · Delivered {} · Tips HK${}", g.year, g.delivered, g.tips)).small());
+                ui.separator();
+                match &g.job {
+                    Some(j) => {
+                        let (c1, c2) = if j.picked { (Color32::GRAY, Color32::from_rgb(255, 200, 90)) } else { (Color32::from_rgb(120, 230, 150), Color32::GRAY) };
+                        ui.colored_label(c1, egui::RichText::new(format!("1. Collect {}{}", j.item, if j.picked { "  (done)" } else { "" })).strong());
+                        ui.colored_label(c1, format!("   from {}", j.from_name));
+                        ui.colored_label(c1, egui::RichText::new(format!("   {}", info.from_addr)).small());
+                        ui.add_space(4.0);
+                        ui.colored_label(c2, egui::RichText::new("2. Deliver it").strong());
+                        ui.colored_label(c2, format!("   to {}", j.to_name));
+                        ui.colored_label(c2, egui::RichText::new(format!("   {}", info.to_addr)).small());
+                    }
+                    None => {
+                        ui.label("Waiting for work...");
+                    }
+                }
+            });
         });
+        if let Some((msg, t)) = &g.toast {
+            let a = (t.min(1.0) * 255.0) as u8;
+            painter.text(
+                Pos2::new(screen.center().x, screen.bottom() - 90.0),
+                Align2::CENTER_CENTER,
+                msg,
+                FontId::proportional(18.0),
+                Color32::from_rgba_unmultiplied(255, 240, 200, a),
+            );
+        }
+    }
+
+    // Controls.
+    egui::Area::new(egui::Id::new("keys")).anchor(Align2::LEFT_BOTTOM, [12.0, -10.0]).show(ui.ctx(), |ui| {
+        ui.colored_label(
+            Color32::from_white_alpha(110),
+            egui::RichText::new(format!(
+                "WASD walk · Shift run · E knock · W on a ladder to climb · T torch ({}) · N night · Tab overview · {fps:.0} fps",
+                if s.torch { "on" } else { "off" }
+            ))
+            .small(),
+        );
     });
+    let _ = w;
 }
 
 fn panel(ui: &mut egui::Ui, s: &mut Settings, st: &stats::Stats, fps: f32) {
@@ -470,14 +646,18 @@ fn main() {
     }
     let world = World::new(1987);
     let orbit = default_orbit(&world.city);
-    // `kowloon --walk` starts on foot in 1987.
-    let walk_now = args.iter().any(|a| a == "--walk");
+    // Default: the delivery game, on foot in 1950. `--walk`: roam 1987 freely.
+    // `--free`: the growth overview.
+    let free_walk = args.iter().any(|a| a == "--walk");
+    let overview = args.iter().any(|a| a == "--free");
+    let walk_now = !overview;
+    let game = (!free_walk && !overview).then(|| game::Game::new(1987, START_YEAR));
     let mut app = App {
         run: None,
         world,
         settings: Settings {
             seed: 1987,
-            year: if walk_now { END_YEAR as f32 } else { START_YEAR as f32 },
+            year: if free_walk { END_YEAR as f32 } else { START_YEAR as f32 },
             playing: !walk_now,
             speed: 2.0,
             mode: ColourMode::Grime,
@@ -487,6 +667,7 @@ fn main() {
         },
         orbit,
         walk: None,
+        game,
         keys: HashSet::new(),
         drag: None,
         last_cursor: None,

@@ -38,6 +38,20 @@ fn target_height(year: u16) -> f32 {
     KEYS.last().unwrap().1
 }
 
+/// The tallest building possible by `year`: huts and two-storey houses in the
+/// early 1950s, the first walk-up blocks late in the decade, towers from the
+/// mid-1960s.
+fn era_cap(year: u16) -> u8 {
+    match year {
+        0..=1953 => 2,
+        1954..=1956 => 3,
+        1957..=1959 => 5,
+        1960..=1962 => 8,
+        1963..=1965 => 11,
+        _ => MAX_FLOORS as u8,
+    }
+}
+
 fn neighbour_plots(city: &City, p: usize) -> Vec<usize> {
     let mut v: Vec<usize> = vec![];
     for &c in &city.plots[p].cells {
@@ -117,7 +131,7 @@ pub fn grow(city: &mut City) {
             let weights: Vec<f32> = (0..n)
                 .map(|p| {
                     let h = heights[p];
-                    if h == 0 || h >= city.plots[p].ambition {
+                    if h == 0 || h >= city.plots[p].ambition.min(era_cap(year)) {
                         return 0.0;
                     }
                     let nb_max = neigh[p].iter().map(|&q| heights[q]).max().unwrap_or(0) as f32;
@@ -141,7 +155,7 @@ pub fn grow(city: &mut City) {
             let h = heights[p];
             let late = ((year as f32 - 1958.0) / 20.0).clamp(0.0, 1.0);
             let jump = if rng.gen::<f32>() < 0.25 + 0.45 * late { rng.gen_range(3..=8) } else { rng.gen_range(1..=2) };
-            let new_h = (h + jump).min(city.plots[p].ambition);
+            let new_h = (h + jump).min(city.plots[p].ambition).min(era_cap(year));
             let rebuild = new_h - h >= 3;
             floors += (new_h - h) as f32;
             set_height(city, p, &mut heights, new_h, year, rebuild);

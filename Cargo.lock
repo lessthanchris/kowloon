@@ -1332,6 +1332,8 @@ dependencies = [
  "kwc-engine",
  "kwc-sim",
  "log",
+ "rand",
+ "rand_chacha",
  "winit",
 ]
 

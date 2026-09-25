@@ -384,6 +384,36 @@ impl<'a> Sim<'a> {
             }
         }
 
+        // Empty flats: households doubled up move out first, then new arrivals.
+        let mut vacant: Vec<u32> = standing
+            .iter()
+            .filter(|u| u.usage == UnitUse::Flat && self.unit_households.get(&u.id).map_or(true, |v| v.is_empty()))
+            .map(|u| u.id)
+            .collect();
+        vacant.shuffle(&mut self.rng);
+        let mut doubled: Vec<u32> = self
+            .unit_households
+            .values()
+            .filter(|v| v.len() > 1)
+            .flat_map(|v| v[1..].to_vec())
+            .collect();
+        doubled.sort_unstable();
+        doubled.shuffle(&mut self.rng);
+        for hh in doubled {
+            let Some(unit) = vacant.pop() else { break };
+            // Not everyone can afford to move out.
+            if self.rng.gen_bool(0.7) {
+                self.move_in(hh, unit, y);
+            } else {
+                vacant.push(unit);
+            }
+        }
+        let fill = if y == START_YEAR { 1.0 } else { 0.85 };
+        for unit in vacant {
+            if self.rng.gen_bool(fill) {
+                self.arrivals(unit, y);
+            }
+        }
         // Businesses: succession, sales, closures; new ones in empty premises.
         for b in 0..self.s.businesses.len() {
             if self.s.businesses[b].closed.is_some() {
@@ -446,36 +476,6 @@ impl<'a> Sim<'a> {
             self.start_tenancy(u.id, Occupant::Business(id), y);
         }
 
-        // Empty flats: households doubled up move out first, then new arrivals.
-        let mut vacant: Vec<u32> = standing
-            .iter()
-            .filter(|u| u.usage == UnitUse::Flat && self.unit_households.get(&u.id).map_or(true, |v| v.is_empty()))
-            .map(|u| u.id)
-            .collect();
-        vacant.shuffle(&mut self.rng);
-        let mut doubled: Vec<u32> = self
-            .unit_households
-            .values()
-            .filter(|v| v.len() > 1)
-            .flat_map(|v| v[1..].to_vec())
-            .collect();
-        doubled.sort_unstable();
-        doubled.shuffle(&mut self.rng);
-        for hh in doubled {
-            let Some(unit) = vacant.pop() else { break };
-            // Not everyone can afford to move out.
-            if self.rng.gen_bool(0.7) {
-                self.move_in(hh, unit, y);
-            } else {
-                vacant.push(unit);
-            }
-        }
-        let fill = if y == START_YEAR { 1.0 } else { 0.85 };
-        for unit in vacant {
-            if self.rng.gen_bool(fill) {
-                self.arrivals(unit, y);
-            }
-        }
     }
 }
 
