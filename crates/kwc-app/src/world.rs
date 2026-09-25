@@ -549,7 +549,14 @@ fn unit_doors(b: &mut Builder, city: &City, year: u16) {
             // Shopfront: most of the cell width; open ones glow, shut ones are shutters.
             b.mesh.ao = 1.0;
             let front = face_box_out(c, d, 0.03, 0.08, C - 0.08, y, y + 2.5);
-            if u.door_state == DoorState::Open {
+            if u.usage == UnitUse::Temple {
+                // Temple: red front glowing with lamps and incense, a lantern either side.
+                b.visual(front, srgb(220, 40, 25), 1.2, only(d));
+                for a in [0.12, C - 0.32] {
+                    let lantern = face_box_out(c, d, 0.35, a, a + 0.2, y + 2.2, y + 2.55);
+                    b.visual(lantern, srgb(255, 90, 40), 2.0, ALL);
+                }
+            } else if u.door_state == DoorState::Open {
                 let col = if r < 0.5 { srgb(255, 214, 160) } else { srgb(220, 255, 230) };
                 b.visual(front, col, 0.9, only(d));
             } else {

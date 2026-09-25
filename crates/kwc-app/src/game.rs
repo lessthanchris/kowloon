@@ -15,6 +15,8 @@ pub enum SpotKind {
     Unit(u32),
     /// A building's street door (its stair landing).
     Building(u32),
+    /// A street plaque (lane index in the directory).
+    Plaque(u16),
 }
 
 /// Somewhere with a name: a flat or shop door, or a building's entrance.
@@ -31,8 +33,12 @@ fn face_point(c: Cell, d: Dir) -> Vec3 {
     Vec3::new((c.0 as f32 + 0.5) * C + dx as f32 * C * 0.5, 0.0, (c.1 as f32 + 0.5) * C + dz as f32 * C * 0.5)
 }
 
-pub fn spots(city: &City, year: u16) -> Vec<Spot> {
+pub fn spots(city: &City, soc: &Society, year: u16) -> Vec<Spot> {
     let mut out = vec![];
+    for (b, lane, out_dir) in crate::lights::plaques(city, &soc.directory) {
+        let c = (b.min + b.max) * 0.5;
+        out.push(Spot { kind: SpotKind::Plaque(lane), stand: c + out_dir * 0.6 - Vec3::Y * c.y, label: c + out_dir * 0.1 + Vec3::Y * 0.35 });
+    }
     for u in city.units_at(year) {
         let (dx, dz) = u.door.facing.delta();
         let out_dir = Vec3::new(dx as f32, 0.0, dz as f32);
@@ -71,6 +77,7 @@ pub fn describe(city: &City, soc: &Society, year: u16, kind: SpotKind) -> (Strin
             };
             (name, addr)
         }
+        SpotKind::Plaque(l) => (soc.directory.lane_names[l as usize].clone(), "street sign".into()),
         SpotKind::Building(p) => {
             let (lane, num) = soc.directory.building[p as usize];
             let h = city.plots[p as usize].height_at(year);

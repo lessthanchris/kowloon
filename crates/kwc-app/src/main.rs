@@ -39,6 +39,8 @@ struct Settings {
     want_walk: bool,
     /// The how-to card (H).
     help: bool,
+    /// Memory mode (G): no place line, door names or arrow; only the street plaques.
+    memory: bool,
 }
 
 struct World {
@@ -79,14 +81,14 @@ struct Walk {
 }
 
 impl Walk {
-    fn new(gpu: &Gpu, city: &City, year: u16) -> Walk {
+    fn new(gpu: &Gpu, city: &City, soc: &society::Society, year: u16) -> Walk {
         let t = Instant::now();
         let (world, mut mesh) = world::build(city, year);
         let lamps = lights::collect(city, year);
         lights::bake(city, year, &lamps, &mut [&mut mesh]);
         log::info!("walk world {year}: {} boxes, {} verts in {:.0?}", world.boxes.len(), mesh.vertices.len(), t.elapsed());
         let player = player::Player::new(world.spawn, world.spawn_yaw);
-        Walk { interior: GpuMesh::upload_chunked(&gpu.device, &mesh), world, player, year, spots: game::spots(city, year) }
+        Walk { interior: GpuMesh::upload_chunked(&gpu.device, &mesh), world, player, year, spots: game::spots(city, soc, year) }
     }
 }
 
@@ -179,6 +181,7 @@ impl ApplicationHandler for App {
                             KeyCode::KeyN => self.settings.night = !self.settings.night,
                             KeyCode::KeyE if walking => self.interact(),
                             KeyCode::KeyH => self.settings.help = !self.settings.help,
+                            KeyCode::KeyG => self.settings.memory = !self.settings.memory,
                             _ => {}
                         }
                     }
@@ -238,7 +241,7 @@ impl App {
         let run = self.run.as_ref().unwrap();
         let year = self.game.as_ref().map_or(self.settings.year.floor() as u16, |g| g.year);
         self.settings.playing = false;
-        self.walk = Some(Walk::new(&run.gpu, &self.world.city, year));
+        self.walk = Some(Walk::new(&run.gpu, &self.world.city, &self.world.society, year));
         let w = &run.window;
         let _ = w.set_cursor_grab(CursorGrabMode::Locked).or_else(|_| w.set_cursor_grab(CursorGrabMode::Confined));
         w.set_cursor_visible(false);
@@ -326,7 +329,7 @@ impl App {
         let stats = stats::measure(&self.world.city, year);
         let fps = self.fps;
         let walk = self.walk.as_ref();
-        let info = walk.map(|w| hud_info(&self.world, w, self.game.as_ref(), &params));
+        let info = walk.map(|w| hud_info(&self.world, w, self.game.as_ref(), &params, s.memory));
         let game = self.game.as_ref();
         let cmds = run.gui.draw(&run.gpu, &run.window, &mut enc, &view, |ui| match (walk, &info) {
             (Some(w), Some(info)) => hud(ui, w, s, game, info, fps),
@@ -361,7 +364,7 @@ struct HudInfo {
 
 /// Work out what the HUD shows this frame: where you are, and the names of
 /// the doors you can see nearby.
-fn hud_info(wd: &World, w: &Walk, g: Option<&game::Game>, params: &FrameParams) -> HudInfo {
+fn hud_info(wd: &World, w: &Walk, g: Option<&game::Game>, params: &FrameParams, memory: bool) -> HudInfo {
     let (city, soc, year) = (&wd.city, &wd.society, w.year);
     let cam = w.player.camera();
     let look = (cam.target - cam.eye).normalize();
@@ -378,6 +381,7 @@ fn hud_info(wd: &World, w: &Walk, g: Option<&game::Game>, params: &FrameParams) 
     let mut cands: Vec<(f32, &game::Spot)> = w
         .spots
         .iter()
+        .filter(|sp| !memory || matches!(sp.kind, game::SpotKind::Plaque(_)))
         .filter_map(|sp| {
             let d = sp.label - cam.eye;
             let dist = d.length();
@@ -410,7 +414,7 @@ fn hud_info(wd: &World, w: &Walk, g: Option<&game::Game>, params: &FrameParams) 
     let addr = |u: u32| soc.directory.address[u as usize].line();
     let (from_addr, to_addr) = g.and_then(|g| g.job.as_ref()).map_or((String::new(), String::new()), |j| (addr(j.from), addr(j.to)));
     // The arrow: which way, how far, and which floor.
-    let arrow = g.and_then(|g| g.job.as_ref()).and_then(|j| {
+    let arrow = g.filter(|_| !memory).and_then(|g| g.job.as_ref()).and_then(|j| {
         let unit = if j.picked { j.to } else { j.from };
         let spot = w.spots.iter().find(|sp| sp.kind == game::SpotKind::Unit(unit))?;
         let p = &w.player;
@@ -434,7 +438,8 @@ fn hud_info(wd: &World, w: &Walk, g: Option<&game::Game>, params: &FrameParams) 
         let what = if j.picked { "Deliver" } else { "Collect" };
         Some((angle, format!("{what} · {dist:.0} m{vertical}")))
     });
-    HudInfo { place: game::place_name(city, soc, year, w.player.pos), labels, from_addr, to_addr, arrow }
+    let place = if memory { "Memory mode · plaques only (G to turn off)".to_string() } else { game::place_name(city, soc, year, w.player.pos) };
+    HudInfo { place, labels, from_addr, to_addr, arrow }
 }
 
 fn hud(ui: &mut egui::Ui, w: &Walk, s: &Settings, g: Option<&game::Game>, info: &HudInfo, fps: f32) {
@@ -561,7 +566,7 @@ fn hud(ui: &mut egui::Ui, w: &Walk, s: &Settings, g: Option<&game::Game>, info: 
         ui.colored_label(
             Color32::from_white_alpha(110),
             egui::RichText::new(format!(
-                "WASD walk · Shift run · E knock · W on a ladder to climb · T torch ({}) · N night · H help · Tab overview · {fps:.0} fps",
+                "WASD walk · Shift run · E knock · W on a ladder to climb · T torch ({}) · N night · G memory mode · H help · Tab overview · {fps:.0} fps",
                 if s.torch { "on" } else { "off" }
             ))
             .small(),
@@ -649,7 +654,7 @@ fn screenshot(args: &[String], out: &str) {
     let walk;
     let mut meshes: Vec<&GpuMesh> = world.mesh.iter().collect();
     let params = if args.iter().any(|a| a == "--walk") {
-        walk = Walk::new(&gpu, &world.city, year);
+        walk = Walk::new(&gpu, &world.city, &world.society, year);
         let mut p = player::Player::new(walk.world.spawn, walk.world.spawn_yaw);
         if let Some(n) = arg::<usize>(args, "--lane") {
             let lane = world.city.lanes.get(n);
@@ -733,6 +738,7 @@ fn main() {
             torch: true,
             want_walk: walk_now,
             help: true,
+            memory: false,
         },
         orbit,
         walk: None,

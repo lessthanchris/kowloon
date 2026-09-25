@@ -58,6 +58,118 @@ pub fn stair_bulb(plot: &Plot, f: i32) -> Option<Aabb> {
 
 const SIGN_COLS: &[[u8; 3]] = &[[255, 60, 70], [255, 90, 180], [80, 255, 140], [70, 220, 255], [255, 190, 60], [240, 240, 255]];
 
+/// Each main lane and its side alleys share a colour: their lamps and most of
+/// their signs, so "the red alleys" come to mean somewhere.
+const FAMILY: &[[u8; 3]] = &[
+    [255, 70, 60],   // red
+    [255, 180, 60],  // amber
+    [90, 255, 150],  // green
+    [80, 210, 255],  // cyan
+    [255, 100, 200], // pink
+    [190, 130, 255], // violet
+    [255, 240, 200], // white
+    [255, 140, 40],  // orange
+    [60, 255, 230],  // teal
+];
+
+/// Which main lane a lane cell belongs to (index into `city.lanes`).
+pub fn family(city: &City, dir: &address::Directory, c: Cell) -> Option<usize> {
+    let name = dir.lane_at(city, c)?;
+    city.lanes.iter().position(|l| name.starts_with(l.name.as_str()))
+}
+
+pub fn family_col(k: usize) -> [f32; 3] {
+    let c = FAMILY[k % FAMILY.len()];
+    srgb(c[0], c[1], c[2])
+}
+
+/// Street plaques: where one lane meets another, a blue enamel plaque on the
+/// wall of each. Returns (plaque, lane index in the directory, facing out).
+pub fn plaques(city: &City, dir: &address::Directory) -> Vec<(Aabb, u16, Vec3)> {
+    let mut out = vec![];
+    for j in 0..city.d as u16 {
+        for i in 0..city.w as u16 {
+            let c = (i, j);
+            let Some(me) = dir.lane_of[city.idx(c)] else { continue };
+            let junction = city.neighbours(c).any(|(_, n)| dir.lane_of[city.idx(n)].is_some_and(|o| o != me));
+            if !junction {
+                continue;
+            }
+            // On the first wall of this cell.
+            if let Some((d, _)) = city.neighbours(c).find(|(_, n)| city.ground_at(*n) == Ground::Plot && city.height_at(*n, u16::MAX) > 0) {
+                let (dx, dz) = d.delta();
+                let out_dir = -Vec3::new(dx as f32, 0.0, dz as f32);
+                // Flat against the neighbour's wall, just proud of it.
+                out.push((plaque_box(c, d), me, out_dir));
+            }
+        }
+    }
+    out
+}
+
+fn face_of(c: Cell, d: Dir) -> Vec3 {
+    let (dx, dz) = d.delta();
+    Vec3::new((c.0 as f32 + 0.5 + dx as f32 * 0.5) * C, 0.0, (c.1 as f32 + 0.5 + dz as f32 * 0.5) * C)
+}
+
+/// A plaque on the wall at face `d` of lane cell `c` (sticking 3 cm into the lane).
+fn plaque_box(c: Cell, d: Dir) -> Aabb {
+    let f = face_of(c, d);
+    let (dx, dz) = d.delta();
+    let (y0, y1) = (2.05, 2.4);
+    if dx != 0 {
+        let x = f.x - dx as f32 * 0.03;
+        Aabb::new(Vec3::new(x.min(f.x), y0, f.z - 0.35), Vec3::new(x.max(f.x), y1, f.z + 0.35))
+    } else {
+        let z = f.z - dz as f32 * 0.03;
+        Aabb::new(Vec3::new(f.x - 0.35, y0, z.min(f.z)), Vec3::new(f.x + 0.35, y1, z.max(f.z)))
+    }
+}
+
+/// Visible landmarks: the South Gate arch, standpipes with their bucket queues,
+/// the Big Well. (Temples are dressed with their doors.)
+pub fn landmarks(city: &City) -> Vec<Fixture> {
+    let mut out = vec![];
+    let stone = srgb(150, 146, 136);
+    for f in &city.features {
+        let (x0, z0) = (f.cell.0 as f32 * C, f.cell.1 as f32 * C);
+        let (cx, cz) = (x0 + C / 2.0, z0 + C / 2.0);
+        match f.kind {
+            FeatureKind::SouthGate => {
+                for (px, pz) in [(x0, z0), (x0 + C - 0.3, z0), (x0, z0 + C - 0.3), (x0 + C - 0.3, z0 + C - 0.3)] {
+                    out.push(Fixture { aabb: Aabb::new(Vec3::new(px, 0.0, pz), Vec3::new(px + 0.3, 3.3, pz + 0.3)), col: stone, emit: 0.0 });
+                }
+                out.push(Fixture { aabb: Aabb::new(Vec3::new(x0 - 0.2, 3.3, z0 - 0.2), Vec3::new(x0 + C + 0.2, 3.8, z0 + C + 0.2)), col: stone, emit: 0.0 });
+                out.push(Fixture { aabb: Aabb::new(Vec3::new(cx - 0.5, 3.35, z0 - 0.25), Vec3::new(cx + 0.5, 3.75, z0 + C + 0.25)), col: srgb(120, 30, 25), emit: -0.1 });
+            }
+            FeatureKind::WaterStandpipe => {
+                out.push(Fixture { aabb: Aabb::new(Vec3::new(cx - 0.05, 0.0, cz - 0.05), Vec3::new(cx + 0.05, 1.1, cz + 0.05)), col: srgb(70, 90, 80), emit: 0.0 });
+                out.push(Fixture { aabb: Aabb::new(Vec3::new(cx - 0.05, 0.95, cz - 0.05), Vec3::new(cx + 0.3, 1.02, cz + 0.05)), col: srgb(70, 90, 80), emit: 0.0 });
+                // The queue of buckets and cans.
+                let cols = [srgb(190, 40, 30), srgb(40, 80, 170), srgb(160, 160, 150), srgb(200, 170, 40)];
+                for k in 0..6 {
+                    let t = k as f32 * 0.32;
+                    let (bx, bz) = (x0 + 0.15 + (t % (C - 0.3)), z0 + 0.1 + (k % 2) as f32 * (C - 0.5));
+                    out.push(Fixture { aabb: Aabb::new(Vec3::new(bx, 0.0, bz), Vec3::new(bx + 0.28, 0.32, bz + 0.28)), col: cols[k % 4], emit: 0.0 });
+                }
+            }
+            FeatureKind::NaturalWell => {
+                let (r, h) = (0.6, 0.7);
+                for (a0, a1, b0, b1) in [(-r, r, -r, -r + 0.2), (-r, r, r - 0.2, r), (-r, -r + 0.2, -r, r), (r - 0.2, r, -r, r)] {
+                    out.push(Fixture { aabb: Aabb::new(Vec3::new(cx + a0, 0.0, cz + b0), Vec3::new(cx + a1, h, cz + b1)), col: stone, emit: 0.0 });
+                }
+                out.push(Fixture { aabb: Aabb::new(Vec3::new(cx - r + 0.2, 0.3, cz - r + 0.2), Vec3::new(cx + r - 0.2, 0.32, cz + r - 0.2)), col: srgb(20, 40, 50), emit: 0.0 });
+                // Rope and pulley frame.
+                out.push(Fixture { aabb: Aabb::new(Vec3::new(cx - r, h, cz - 0.04), Vec3::new(cx - r + 0.08, 2.0, cz + 0.04)), col: srgb(110, 80, 50), emit: 0.0 });
+                out.push(Fixture { aabb: Aabb::new(Vec3::new(cx + r - 0.08, h, cz - 0.04), Vec3::new(cx + r, 2.0, cz + 0.04)), col: srgb(110, 80, 50), emit: 0.0 });
+                out.push(Fixture { aabb: Aabb::new(Vec3::new(cx - r, 1.95, cz - 0.04), Vec3::new(cx + r, 2.03, cz + 0.04)), col: srgb(110, 80, 50), emit: 0.0 });
+            }
+            _ => {}
+        }
+    }
+    out
+}
+
 fn centre(c: Cell) -> (f32, f32) {
     ((c.0 as f32 + 0.5) * C, (c.1 as f32 + 0.5) * C)
 }
@@ -77,7 +189,12 @@ fn on_wall(c: Cell, d: Dir, a0: f32, a1: f32, y0: f32, y1: f32, out: f32) -> Aab
 /// Lamps on lane walls, signs over the lanes, and signboards on the outer wall
 /// (the Walled City's edge was plastered with dentists' boards).
 pub fn fixtures(city: &City, year: u16) -> Vec<Fixture> {
-    let mut out = vec![];
+    let dir = address::build(city);
+    let mut out = landmarks(city);
+    for (b, lane, _) in plaques(city, &dir) {
+        let _ = lane;
+        out.push(Fixture { aabb: b, col: srgb(30, 60, 150), emit: -0.25 });
+    }
     for j in 0..city.d as u16 {
         for i in 0..city.w as u16 {
             let c = (i, j);
@@ -94,9 +211,15 @@ pub fn fixtures(city: &City, year: u16) -> Vec<Fixture> {
                 match city.ground_at(n) {
                     Ground::Alley => {
                         // A bulb or a tube bracketed to the wall above head height.
+                        let fam = family(city, &dir, n);
                         if r(1) < 0.14 {
                             let bulb = r(2) < 0.5;
-                            let col = if bulb { srgb(255, 190, 120) } else { TUBE_COL };
+                            // Lamps are tinted with their lane family's colour.
+                            let col = match fam {
+                                Some(k) if r(7) < 0.8 => family_col(k),
+                                _ if bulb => srgb(255, 190, 120),
+                                _ => TUBE_COL,
+                            };
                             let (a0, a1) = if bulb { (0.65, 0.85) } else { (0.2, 1.3) };
                             out.push(Fixture { aabb: on_wall(c, d, a0, a1, 2.55, 2.65, 0.15), col, emit: 2.0 });
                         }
@@ -106,7 +229,10 @@ pub fn fixtures(city: &City, year: u16) -> Vec<Fixture> {
                             let y = f as f32 * S + 0.6;
                             let sc = SIGN_COLS[(r(5) * SIGN_COLS.len() as f32) as usize % SIGN_COLS.len()];
                             let lit = r(6) < 0.75;
-                            let col = srgb(sc[0], sc[1], sc[2]);
+                            let col = match fam {
+                                Some(k) if r(8) < 0.7 => family_col(k),
+                                _ => srgb(sc[0], sc[1], sc[2]),
+                            };
                             out.push(Fixture { aabb: on_wall(c, d, 0.7, 0.8, y, y + 1.6, 0.9), col, emit: if lit { -1.4 } else { -0.05 } });
                         }
                     }
