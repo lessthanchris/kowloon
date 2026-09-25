@@ -456,7 +456,7 @@ impl App {
     }
 
     fn start_run(&mut self, course: course::Course, cat: runs::Category) {
-        self.use_city(course.seed as u64);
+        self.use_city(course.city_seed());
         self.game = Some(game::Game::new(course.seed as u64, course.era));
         self.settings.year = course.era as f32;
         self.race = Some(runs::Run::new(course, cat, &self.records));
@@ -918,7 +918,7 @@ fn title_screen(ui: &mut egui::Ui, s: &mut Settings, records: &runs::Records, su
                     act = Some(TitleAction::Race(daily, cat));
                 }
                 if ui.button("Random").clicked() {
-                    act = Some(TitleAction::Race(course::Course::random(), cat));
+                    act = Some(TitleAction::Race(course::Course::random(course::Course::daily().era, false), cat));
                 }
             });
             ui.horizontal(|ui| {
@@ -1441,14 +1441,14 @@ fn main() {
     } else if args.iter().any(|a| a == "--daily") {
         Some(course::Course::daily())
     } else if args.iter().any(|a| a == "--random") {
-        Some(course::Course::random())
+        Some(course::Course::random(arg::<u16>(&args, "--era").filter(|e| game::ERAS.contains(e)).unwrap_or(START_YEAR), args.iter().any(|a| a == "--wild")))
     } else {
         None
     };
     if let Some(c) = course {
         println!("Course {}", c.code());
     }
-    let seed = course.map_or(1987, |c| c.seed as u64);
+    let seed = course.map_or(course::CITY, |c| c.city_seed());
     let world = World::new(seed);
     let orbit = default_orbit(&world.city);
     // Default: the delivery game, on foot in 1950. `--walk`: roam 1987 freely.
@@ -1835,7 +1835,7 @@ mod tests {
     fn same_code_same_course() {
         let jobs = |code: &str| {
             let c = course::Course::parse(code).unwrap();
-            let city = generate(&Params { seed: c.seed as u64, ..Default::default() });
+            let city = generate(&Params { seed: c.city_seed(), ..Default::default() });
             let soc = kwc_sim::society::generate(&city);
             let mut g = game::Game::new(c.seed as u64, c.era);
             (0..10)

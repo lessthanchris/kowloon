@@ -255,7 +255,7 @@ mod tests {
 
     #[test]
     fn clock_starts_on_the_first_step_and_stops_at_the_last_delivery() {
-        let course = Course { seed: 1, era: 1950 };
+        let course = Course { seed: 1, era: 1950, wild: false };
         let mut records = Records::default();
         let mut r = Run::new(course, Category::Rounds, &records);
         for _ in 0..50 {
@@ -278,7 +278,7 @@ mod tests {
 
     #[test]
     fn ghost_follows_the_recorded_run() {
-        let course = Course { seed: 2, era: 1950 };
+        let course = Course { seed: 2, era: 1950, wild: false };
         let mut records = Records::default();
         let mut r = Run::new(course, Category::Rounds, &records);
         r.record(Vec3::ZERO, 0.0);
