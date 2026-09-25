@@ -15,7 +15,8 @@ pub fn heading() -> Vec3 {
     Vec3::new(0.766, -0.02, 0.643).normalize()
 }
 
-/// An oriented box: centre, axes (unit vectors) and half-sizes along them.
+/// An oriented box: centre, axes (right-handed: f × r = u, or the faces
+/// come out inside-out) and half-sizes along them.
 pub fn obox(m: &mut MeshData, c: Vec3, f: Vec3, r: Vec3, u: Vec3, h: Vec3, col: [f32; 3], emit: f32) {
     let p = |sf: f32, sr: f32, su: f32| c + f * (h.x * sf) + r * (h.y * sr) + u * (h.z * su);
     let faces = [
@@ -43,7 +44,7 @@ pub fn mesh(t: f32, centre: Vec3) -> Option<MeshData> {
     let along = -700.0 + 1400.0 * s;
     let pos = centre + Vec3::new(f.x, 0.0, f.z) * along + Vec3::Y * (75.0 - 30.0 * s);
     let fwd = Vec3::new(f.x, 0.0, f.z).normalize();
-    let right = fwd.cross(Vec3::Y).normalize();
+    let right = Vec3::Y.cross(fwd).normalize();
     let up = Vec3::Y;
     let mut m = MeshData::default();
     let body = srgb(200, 200, 205);

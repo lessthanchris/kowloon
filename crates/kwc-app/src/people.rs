@@ -173,7 +173,7 @@ impl Frame {
     /// A box centred at `c`, half-size (width, height, depth).
     fn part(&self, mesh: &mut MeshData, c: Vec3, h: Vec3, col: [f32; 3]) {
         let (x, y, z) = (self.m.x_axis, self.m.y_axis, self.m.z_axis);
-        obox(mesh, self.o + self.m * c, z, -x, y, Vec3::new(h.z, h.x, h.y), col, 0.0);
+        obox(mesh, self.o + self.m * c, z, x, y, Vec3::new(h.z, h.x, h.y), col, 0.0);
     }
 }
 
