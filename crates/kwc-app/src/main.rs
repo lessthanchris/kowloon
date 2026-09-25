@@ -62,7 +62,12 @@ struct Settings {
     course: Option<String>,
     /// Title screen: the code typed in, and the run category chosen.
     title_code: String,
-    memory_run: bool,
+    /// Title: the race category, era and whether a random course grows a wild city.
+    race_cat: runs::Category,
+    race_era: u16,
+    wild: bool,
+    /// Practice: the route line to the next door.
+    route_on: bool,
     /// The settings panel, and the action waiting for a key to be pressed.
     settings_open: bool,
     rebinding: Option<prefs::Action>,
@@ -192,6 +197,9 @@ struct App {
     race: Option<runs::Run>,
     records: runs::Records,
     prefs: prefs::Prefs,
+    /// The guided tour, when it's on; the practice route line.
+    tour: Option<Tour>,
+    guide: autopilot::Guide,
     started: Instant,
     plane: Option<GpuMesh>,
     /// Everyone near you, posed for this frame.
@@ -300,7 +308,10 @@ impl ApplicationHandler for App {
                                     self.prefs.save();
                                 }
                             }
-                            Some(A::Knock) if walking => self.interact(),
+                            Some(A::Route) if self.race.as_ref().is_some_and(|r| r.cat == runs::Category::Practice) => {
+                                self.settings.route_on = !self.settings.route_on;
+                            }
+                            Some(A::Knock) if walking && self.tour.is_none() => self.interact(),
                             Some(A::Help) => self.settings.help = !self.settings.help,
                             Some(A::Memory) => self.settings.memory = !self.settings.memory,
                             Some(A::Autopilot) if walking && self.game.is_some() => {
@@ -400,8 +411,8 @@ impl App {
     }
 
     fn save_game(&self) {
-        // Races aren't saved: they always start from the beginning.
-        if self.race.is_some() {
+        // Races and tours aren't saved: they always start from the beginning.
+        if self.race.is_some() || self.tour.is_some() {
             return;
         }
         if let Some(g) = &self.game {
@@ -423,6 +434,9 @@ impl App {
         self.parked = None;
         self.race = None;
         self.autopilot = None;
+        self.tour = None;
+        self.guide = autopilot::Guide::default();
+        self.settings.route_on = false;
         self.pending_era = None;
         self.settings.map_open = false;
         self.settings.ledger_open = false;
@@ -462,9 +476,28 @@ impl App {
         self.settings.year = course.era as f32;
         self.race = Some(runs::Run::new(course, cat, &self.records));
         self.settings.memory = cat == runs::Category::Memory;
+        self.settings.route_on = cat == runs::Category::Practice;
         self.settings.help = false;
         self.settings.course = None;
         self.autopilot = None;
+        self.title = false;
+        self.settings.want_walk = true;
+    }
+
+    /// The guided tour: the courier leads you past every landmark, with a
+    /// word about each, in `era`.
+    fn start_tour(&mut self, era: u16) {
+        self.use_city(course::CITY);
+        let c = &self.world.city;
+        let gate = Vec3::new((c.south_gate.0 as f32 + 0.5) * CELL_M, 0.0, (c.south_gate.1 as f32 + 0.5) * CELL_M);
+        self.tour = Some(Tour { stops: wayfinding::tour(c, era, gate), i: 0, pause: 0.0 });
+        self.game = None;
+        self.race = None;
+        self.settings.year = era as f32;
+        self.settings.memory = false;
+        self.settings.help = false;
+        self.settings.course = None;
+        self.autopilot = Some(autopilot::Autopilot::default());
         self.title = false;
         self.settings.want_walk = true;
     }
@@ -583,6 +616,7 @@ impl App {
         // Demo mode drives until you touch the keys.
         if self.autopilot.is_some() && (input.forward != 0.0 || input.strafe != 0.0) {
             self.autopilot = None;
+            self.tour = None;
             if let Some(g) = self.game.as_mut() {
                 g.toast("You take over.");
             }
@@ -592,8 +626,11 @@ impl App {
         for _ in 0..self.clock.advance(dt) {
             let mut step = input;
             let mut act = autopilot::Act::Walk;
-            if let (Some(ap), Some(w), Some(g)) = (self.autopilot.as_mut(), self.walk.as_mut(), self.game.as_ref()) {
-                let target = autopilot::target(g, &w.spots);
+            if let (Some(ap), Some(w)) = (self.autopilot.as_mut(), self.walk.as_mut()) {
+                let target = match &self.tour {
+                    Some(t) => t.target(),
+                    None => self.game.as_ref().and_then(|g| autopilot::target(g, &w.spots)),
+                };
                 (step, act) = ap.drive(&w.world, &self.world.city, w.year, &mut w.player, target, TICK);
             }
             if let Some(w) = self.walk.as_mut() {
@@ -605,7 +642,10 @@ impl App {
                 }
             }
             match act {
-                autopilot::Act::Knock => self.interact(),
+                autopilot::Act::Knock => match self.tour.as_mut() {
+                    Some(t) => t.arrive(),
+                    None => self.interact(),
+                },
                 autopilot::Act::Lost => {
                     if let Some(g) = self.game.as_mut() {
                         g.job = None;
@@ -621,6 +661,16 @@ impl App {
             w.player.bob_scale = self.prefs.head_bob;
         }
         self.settings.demo_status = self.autopilot.as_ref().map(|a| a.status.clone());
+        if let Some(t) = self.tour.as_mut() {
+            t.tick(dt);
+        }
+        match (self.walk.as_ref(), self.race.as_ref()) {
+            (Some(w), Some(r)) if r.cat == runs::Category::Practice && self.settings.route_on => {
+                let to = self.game.as_ref().and_then(|g| autopilot::target(g, &w.spots)).map(|t| t.stand);
+                self.guide.update(&w.world, &self.world.city, w.year, w.player.pos, to, dt);
+            }
+            _ => self.guide.path.clear(),
+        }
         if let Some(g) = self.game.as_mut() {
             g.tick(dt);
             if g.job.is_none() {
@@ -708,6 +758,7 @@ impl App {
             if let Some(g) = race.and_then(|r| r.ghost.as_ref().map(|g| (g, r.ticks))).map(|(g, ticks)| g.at(ticks)) {
                 people::ghost_mesh(&mut m, g.0, g.1, g.2, g.3, t);
             }
+            self.guide.mesh(&mut m, cam.eye);
             GpuMesh::upload(&run.gpu.device, &m)
         });
         let mut meshes: Vec<&GpuMesh> = self.world.mesh.iter().chain(self.plane.iter()).chain(self.people.iter()).collect();
@@ -730,6 +781,9 @@ impl App {
         let progress = game.map(|g| (g.coverage(city), g.clean, g.knows_era(city), g.next_era()));
         let pending = self.pending_era;
         let (title, race, records, summary) = (self.title, self.race.as_ref(), &self.records, self.save_summary.as_deref());
+        let route_key = prefs::key_name(self.prefs.key(prefs::Action::Route));
+        let caption = self.tour.as_ref().and_then(|t| t.caption());
+        let unlocked = self.records.unlocked();
         let prefs = &mut self.prefs;
         let mut prefs_changed = false;
         let mut action = None;
@@ -737,7 +791,10 @@ impl App {
             (Some(w), Some(info)) => {
                 hud(ui, w, s, game, info, fps, progress);
                 if let Some(r) = race {
-                    runs::hud(ui, r);
+                    runs::hud(ui, r, &route_key, s.route_on);
+                }
+                if let Some((name, about)) = &caption {
+                    tour_card(ui, name, about);
                 }
                 if let (true, Some(g)) = (s.map_open, game) {
                     panels::notebook(ui, city, soc, g, w.player.pos, w.player.yaw);
@@ -747,7 +804,7 @@ impl App {
                 }
             }
             _ if title && s.settings_open => prefs_changed = settings_panel(ui, s, prefs),
-            _ if title => action = title_screen(ui, s, records, summary),
+            _ if title => action = title_screen(ui, s, records, summary, &unlocked),
             _ => {
                 panel(ui, s, &stats, fps);
                 if let Some(n) = pending {
@@ -778,6 +835,7 @@ impl App {
             Some(TitleAction::Continue) => self.start_campaign(false),
             Some(TitleAction::NewGame) => self.start_campaign(true),
             Some(TitleAction::Race(c, cat)) => self.start_run(c, cat),
+            Some(TitleAction::Tour(era)) => self.start_tour(era),
             None => {}
         }
     }
@@ -787,7 +845,7 @@ impl App {
 fn keys_line(p: &prefs::Prefs) -> String {
     use prefs::{key_name as n, Action as A};
     format!(
-        "{}{}{}{} walk · {} jog · {} hop/vault · {} knock · {} autopilot · {} notebook · {} ledger · {} memory · {} move on · {} torch · {} night · {} help · Esc menu · Tab overview · {} vsync",
+        "{}{}{}{} walk · {} jog · {} hop/vault · {} knock · {} autopilot · {} notebook · {} ledger · {} memory · {} move on · {} torch · {} night · {} help · {} route (practice) · Esc menu · Tab overview · {} vsync",
         n(p.key(A::Forward)),
         n(p.key(A::Left)),
         n(p.key(A::Back)),
@@ -803,6 +861,7 @@ fn keys_line(p: &prefs::Prefs) -> String {
         n(p.key(A::Torch)),
         n(p.key(A::Night)),
         n(p.key(A::Help)),
+        n(p.key(A::Route)),
         n(p.key(A::Vsync)),
     )
 }
@@ -870,6 +929,61 @@ enum TitleAction {
     Continue,
     NewGame,
     Race(course::Course, runs::Category),
+    Tour(u16),
+}
+
+/// The guided tour: stops in order, which one we're heading for, and how
+/// long is left reading the one we're at.
+struct Tour {
+    stops: Vec<wayfinding::Stop>,
+    i: usize,
+    pause: f32,
+}
+
+impl Tour {
+    fn target(&self) -> Option<autopilot::Target> {
+        if self.pause > 0.0 {
+            return None;
+        }
+        let s = self.stops.get(self.i)?;
+        Some(autopilot::Target { unit: autopilot::TOUR_STOP + self.i as u32, picked: false, stand: s.stand, door: s.facing })
+    }
+
+    fn arrive(&mut self) {
+        self.pause = 9.0;
+    }
+
+    fn tick(&mut self, dt: f32) {
+        if self.pause > 0.0 {
+            self.pause -= dt;
+            if self.pause <= 0.0 {
+                self.pause = 0.0;
+                self.i += 1;
+            }
+        }
+    }
+
+    fn caption(&self) -> Option<(String, String)> {
+        if self.pause > 0.0 {
+            let s = &self.stops[self.i];
+            Some((s.name.clone(), s.about.clone()))
+        } else if self.i >= self.stops.len() {
+            Some(("That's the tour".into(), "The signposts at the junctions point back to all of these. Walk on from here, or Esc for the menu.".into()))
+        } else {
+            None
+        }
+    }
+}
+
+fn tour_card(ui: &mut egui::Ui, name: &str, about: &str) {
+    use egui::{Align2, Color32, RichText};
+    egui::Area::new(egui::Id::new("tour")).anchor(Align2::CENTER_BOTTOM, [0.0, -70.0]).show(ui.ctx(), |ui| {
+        egui::Frame::new().fill(Color32::from_rgba_unmultiplied(16, 14, 12, 230)).inner_margin(16.0).corner_radius(6.0).show(ui, |ui| {
+            ui.set_max_width(560.0);
+            ui.colored_label(Color32::from_rgb(255, 214, 120), RichText::new(name).size(20.0));
+            ui.colored_label(Color32::from_rgb(236, 228, 208), about);
+        });
+    });
 }
 
 /// What the campaign save holds, for the Continue button.
@@ -879,7 +993,7 @@ fn campaign_summary() -> Option<String> {
 }
 
 /// The title: carry on the campaign, or race a course.
-fn title_screen(ui: &mut egui::Ui, s: &mut Settings, records: &runs::Records, summary: Option<&str>) -> Option<TitleAction> {
+fn title_screen(ui: &mut egui::Ui, s: &mut Settings, records: &runs::Records, summary: Option<&str>, unlocked: &[u16]) -> Option<TitleAction> {
     use egui::{Align2, Color32, RichText};
     let paper = Color32::from_rgb(236, 228, 208);
     let dim = Color32::from_gray(160);
@@ -904,23 +1018,52 @@ fn title_screen(ui: &mut egui::Ui, s: &mut Settings, records: &runs::Records, su
                     act = Some(TitleAction::NewGame);
                 }
             });
+            ui.horizontal(|ui| {
+                ui.colored_label(dim, RichText::new("Guided tour of the landmarks:").small());
+                for era in [1950u16, 1987] {
+                    if ui.small_button(format!("{era}")).clicked() {
+                        act = Some(TitleAction::Tour(era));
+                    }
+                }
+            });
             ui.add_space(16.0);
             ui.colored_label(Color32::from_rgb(120, 200, 255), RichText::new("Race").size(18.0));
-            ui.colored_label(dim, RichText::new(format!("{} deliveries against the clock. Same code, same city, same jobs.", runs::DELIVERIES)).small());
+            ui.colored_label(dim, RichText::new(format!("{} deliveries against the clock, in the Walled City everyone learns. Same code, same jobs.", runs::DELIVERIES)).small());
             ui.horizontal(|ui| {
-                ui.radio_value(&mut s.memory_run, false, "Rounds (arrow and names)");
-                ui.radio_value(&mut s.memory_run, true, "Memory (plaques only)");
+                ui.radio_value(&mut s.race_cat, runs::Category::Rounds, "Rounds");
+                ui.radio_value(&mut s.race_cat, runs::Category::Memory, "Memory");
+                ui.radio_value(&mut s.race_cat, runs::Category::Practice, "Practice");
             });
-            let cat = if s.memory_run { runs::Category::Memory } else { runs::Category::Rounds };
+            let hint = match s.race_cat {
+                runs::Category::Rounds => "Arrow and door names on.",
+                runs::Category::Memory => "Street plaques and signposts only: you find the way.",
+                runs::Category::Practice => "No clock. The route line (and the notebook) show you the way.",
+            };
+            ui.colored_label(dim, RichText::new(hint).small());
+            if !unlocked.contains(&s.race_era) {
+                s.race_era = *unlocked.last().unwrap_or(&START_YEAR);
+            }
+            ui.horizontal(|ui| {
+                ui.colored_label(dim, RichText::new("Era").small());
+                for e in game::ERAS {
+                    if unlocked.contains(&e) {
+                        ui.selectable_value(&mut s.race_era, e, e.to_string());
+                    } else {
+                        ui.add_enabled(false, egui::Button::new(e.to_string())).on_disabled_hover_text("Finish a race in the era before to open this one");
+                    }
+                }
+            });
+            let cat = s.race_cat;
             let best = |c: course::Course| records.best(c, cat).and_then(|b| b.last()).map_or(String::new(), |&t| format!(" · best {}", runs::clock(t)));
             let daily = course::Course::daily();
             ui.horizontal(|ui| {
                 if ui.button(format!("Today's course {}{}", daily.code(), best(daily))).clicked() {
                     act = Some(TitleAction::Race(daily, cat));
                 }
-                if ui.button("Random").clicked() {
-                    act = Some(TitleAction::Race(course::Course::random(course::Course::daily().era, false), cat));
+                if ui.button(format!("Random ({})", s.race_era)).clicked() {
+                    act = Some(TitleAction::Race(course::Course::random(s.race_era, s.wild), cat));
                 }
+                ui.checkbox(&mut s.wild, "wild city").on_hover_text("A city grown fresh for the course, instead of the one everyone learns");
             });
             ui.horizontal(|ui| {
                 ui.add(egui::TextEdit::singleline(&mut s.title_code).hint_text("KWC-1965-7F3A").desired_width(160.0).font(egui::TextStyle::Monospace));
@@ -1498,7 +1641,10 @@ fn main() {
             vsync: true,
             course: None,
             title_code: String::new(),
-            memory_run: false,
+            race_cat: runs::Category::Rounds,
+            race_era: START_YEAR,
+            wild: false,
+            route_on: false,
             settings_open: false,
             rebinding: None,
             keys_line: String::new(),
@@ -1516,6 +1662,8 @@ fn main() {
         race: None,
         records: runs::Records::load(),
         prefs: prefs::Prefs::load().0,
+        tour: None,
+        guide: autopilot::Guide::default(),
         started: Instant::now(),
         plane: None,
         people: None,
@@ -1907,6 +2055,23 @@ mod tests {
             }
         }
         eprintln!("TOTAL: {all_done} delivered, {all_lost} lost, {all_stuck} snags");
+    }
+
+    /// Every guided-tour stop can be walked to from the South Gate, in the
+    /// open 1950 city and the 1987 maze, and there's one for each landmark.
+    #[test]
+    fn tour_stops_are_reachable() {
+        let city = generate(&Params { seed: course::CITY, ..Default::default() });
+        let gate = Vec3::new((city.south_gate.0 as f32 + 0.5) * CELL_M, 0.0, (city.south_gate.1 as f32 + 0.5) * CELL_M);
+        for year in [START_YEAR, END_YEAR] {
+            let (w, _) = world::build(&city, year);
+            let stops = wayfinding::tour(&city, year, gate);
+            assert!(stops.len() >= 4, "{year}: only {} stops", stops.len());
+            let from = w.spawn;
+            for s in &stops {
+                assert!(autopilot::route(&w, &city, year, from, s.stand).is_some(), "{year}: can't walk to {}", s.name);
+            }
+        }
     }
 
     /// A save from inside what is now a hut gets you out, not stuck.

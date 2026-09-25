@@ -26,10 +26,11 @@ pub enum Action {
     Restart,
     Help,
     Vsync,
+    Route,
 }
 
 impl Action {
-    pub const ALL: [Action; 17] = [
+    pub const ALL: [Action; 18] = [
         Action::Forward,
         Action::Back,
         Action::Left,
@@ -47,6 +48,7 @@ impl Action {
         Action::Restart,
         Action::Help,
         Action::Vsync,
+        Action::Route,
     ];
 
     pub fn label(self) -> &'static str {
@@ -68,6 +70,7 @@ impl Action {
             Action::Restart => "Restart race",
             Action::Help => "Help card",
             Action::Vsync => "Vsync",
+            Action::Route => "Route line (practice)",
         }
     }
 
@@ -90,6 +93,7 @@ impl Action {
             Action::Restart => KeyCode::KeyR,
             Action::Help => KeyCode::KeyH,
             Action::Vsync => KeyCode::KeyV,
+            Action::Route => KeyCode::KeyK,
         }
     }
 }

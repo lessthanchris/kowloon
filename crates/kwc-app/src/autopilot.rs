@@ -8,6 +8,7 @@ use crate::player::{Input, Player, HEIGHT, RADIUS};
 use crate::world::{Aabb, WalkWorld};
 use glam::Vec3;
 use std::cmp::Reverse;
+use kwc_engine::mesh::MeshData;
 use kwc_sim::*;
 use std::collections::{BinaryHeap, HashMap};
 use std::sync::Arc;
@@ -345,7 +346,7 @@ impl Autopilot {
         }
         if self.k >= self.path.len() {
             // At the door: turn to it, a beat, knock.
-            self.status = if t.picked { "Delivering".into() } else { "Collecting".into() };
+            self.status = verb(&t).into();
             turn_to(p, t.door.z.atan2(t.door.x), dt);
             p.pitch += (-0.05 - p.pitch) * (dt * 4.0).min(1.0);
             self.wait += dt;
@@ -399,7 +400,7 @@ impl Autopilot {
         let rise = (ahead.y - p.pos.y) / flat(p.pos, ahead).max(1.0);
         p.pitch += ((rise * 0.7).clamp(-0.45, 0.35) - 0.04 - p.pitch) * (dt * 2.5).min(1.0);
         let left: f32 = self.path[self.k..].windows(2).map(|s| s[0].distance(s[1])).sum::<f32>() + d;
-        self.status = format!("{} · {left:.0} m", if t.picked { "Delivering" } else { "Collecting" });
+        self.status = format!("{} · {left:.0} m", verb(&t));
         let input = Input { forward: if err.abs() < 0.7 { 1.0 } else { 0.25 }, run: left > 8.0 && err.abs() < 0.3, ..Default::default() };
         (input, Act::Walk)
     }
@@ -414,6 +415,86 @@ impl Autopilot {
         self.path.clear();
     }
 }
+
+/// Practice: a faint line on the ground along the way to the next door,
+/// replanned (off the main thread) when the target changes or you stray.
+#[derive(Default)]
+pub struct Guide {
+    pub path: Vec<Vec3>,
+    pending: Option<std::sync::mpsc::Receiver<Option<Vec<Vec3>>>>,
+    to: Option<Vec3>,
+    cooldown: f32,
+}
+
+impl Guide {
+    pub fn update(&mut self, w: &Arc<WalkWorld>, city: &Arc<City>, year: u16, from: Vec3, to: Option<Vec3>, dt: f32) {
+        if let Some(rx) = &self.pending {
+            if let Ok(r) = rx.try_recv() {
+                self.path = r.unwrap_or_default();
+                self.pending = None;
+            }
+        }
+        self.cooldown -= dt;
+        let Some(to) = to else {
+            self.path.clear();
+            self.to = None;
+            return;
+        };
+        let off = self.path.windows(2).map(|s| near_segment(from, s[0], s[1])).fold(f32::MAX, f32::min);
+        let changed = self.to != Some(to);
+        if (changed || (off > 2.5 && self.cooldown <= 0.0)) && self.pending.is_none() {
+            if changed {
+                self.path.clear();
+            }
+            self.to = Some(to);
+            self.cooldown = 1.5;
+            let (tx, rx) = std::sync::mpsc::channel();
+            let (w, city) = (w.clone(), city.clone());
+            std::thread::spawn(move || {
+                let _ = tx.send(route(&w, &city, year, from, to));
+            });
+            self.pending = Some(rx);
+        }
+    }
+
+    /// Small glowing marks every half metre along the way, near you.
+    pub fn mesh(&self, m: &mut MeshData, eye: Vec3) {
+        let mut carry = 0.0;
+        for s in self.path.windows(2) {
+            let len = s[0].distance(s[1]);
+            let mut t = carry;
+            while t < len {
+                let p = s[0].lerp(s[1], t / len);
+                if p.distance(eye) < 35.0 {
+                    let (a, b) = (p + Vec3::new(-0.06, 0.02, -0.06), p + Vec3::new(0.06, 0.05, 0.06));
+                    m.cuboid(a, b, [0.35, 0.85, 1.0], -1.4, kwc_engine::mesh::Faces::ALL);
+                }
+                t += 0.5;
+            }
+            carry = t - len;
+        }
+    }
+}
+
+fn near_segment(p: Vec3, a: Vec3, b: Vec3) -> f32 {
+    let ab = b - a;
+    let t = ((p - a).dot(ab) / ab.length_squared().max(1e-6)).clamp(0.0, 1.0);
+    p.distance(a + ab * t)
+}
+
+/// What the courier's doing, for the status line.
+fn verb(t: &Target) -> &'static str {
+    if t.unit >= TOUR_STOP {
+        "On tour"
+    } else if t.picked {
+        "Delivering"
+    } else {
+        "Collecting"
+    }
+}
+
+/// Tour stops use unit numbers from here up (no real unit gets near it).
+pub const TOUR_STOP: u32 = 1_000_000;
 
 /// Turn towards `yaw` at a comfortable rate; returns the remaining error.
 fn turn_to(p: &mut Player, yaw: f32, dt: f32) -> f32 {

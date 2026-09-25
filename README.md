@@ -12,7 +12,15 @@ The city is grown, not built. A simulation accretes it year by year from a squat
 
 From the title screen:
 - **Campaign:** start in 1950 as a courier. Learn the lanes, make deliveries from memory, and move on through the eras when you're ready.
-- **Race:** 5 deliveries against the clock on a **course code** such as `KWC-1965-7F3A`. The same code gives the same city, the same era and the same jobs, so you can share one and race a friend. Your best run comes back as a ghost to race against. Choose **Rounds** (arrow and door names) or **Memory** (street plaques only). There's a new daily course every day.
+- **Guided tour:** the courier walks you past the landmarks (the South Gate, the Yamen, the Big Well, the temples) in 1950 or 1987, with a word about each.
+- **Race:** 5 deliveries against the clock on a **course code** such as `KWC-1965-7F3A`. Every `KWC` code is set in the same Walled City, so what you learn carries over; `KWX` codes grow a fresh "wild" city. The same code gives the same jobs, so you can share one and race a friend. Your best run comes back as a ghost. There are three categories:
+  - **Rounds:** arrow and door names on.
+  - **Memory:** street plaques and signposts only.
+  - **Practice:** no clock, and a route line (K) shows you the way.
+
+  Eras open one at a time: finish a race in one to unlock the next. There's a new daily course every day.
+
+Signposts at lane junctions and gates point the walking way to the landmarks in every era, and stair landings have their floor numbers painted up. Both help you find your bearings in the 1987 maze.
 
 | Key | |
 |---|---|
@@ -26,10 +34,14 @@ From the title screen:
 | T / N | torch / night |
 | R | run a race again |
 | P | autopilot demo (campaign) |
+| K | route line (Practice) |
 | V | vsync on/off |
+| F11 | fullscreen |
 | Esc | menu |
 
-Command line: `kowloon.exe --daily`, `--random`, `--code KWC-1965-7F3A [--memory]`, `--era 1970`, `--demo`.
+Every key can be changed in **Settings** on the title screen, along with mouse sensitivity, field of view and head bob.
+
+Command line: `kowloon.exe --daily`, `--random [--era 1970] [--wild]`, `--code KWC-1965-7F3A [--memory]`, `--demo`.
 
 ## Build from source
 

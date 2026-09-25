@@ -23,6 +23,71 @@ pub struct Signpost {
     pub gate: bool,
 }
 
+/// A stop on the guided tour: what it is, a word about it, where to stand,
+/// and which way to look.
+pub struct Stop {
+    pub name: String,
+    pub about: String,
+    pub stand: Vec3,
+    pub facing: Vec3,
+}
+
+fn about(name: &str) -> String {
+    let s = if name.contains("South Gate") {
+        "The South Gate. The old fort's walls came down during the war, but this stayed the way in, off Tung Tau Tsuen Road."
+    } else if name.contains("Yamen") {
+        "The Yamen: the old magistrate's offices from the Qing garrison, and the one place that was never built over. Over the years it was an almshouse, a school and a clinic."
+    } else if name.contains("Well") {
+        "The Big Well. Before water was piped in there were only a handful of standpipes for the whole city, and people queued with buckets."
+    } else if name.contains("Tin Hau") {
+        "Tin Hau Temple, for the goddess of the sea, patron of the fishing families who brought her here."
+    } else if name.contains("Fuk Tak") {
+        "Fuk Tak Temple, for the earth god who watches over a neighbourhood."
+    } else {
+        "A landmark worth knowing."
+    };
+    s.to_string()
+}
+
+/// The guided tour: every landmark, nearest first from `start`, each with
+/// somewhere to stand in the lane beside it.
+pub fn tour(city: &City, year: u16, start: Vec3) -> Vec<Stop> {
+    let mut stops: Vec<Stop> = landmarks(city)
+        .into_iter()
+        .filter_map(|(name, cells)| {
+            let at = |c: Cell| Vec3::new((c.0 as f32 + 0.5) * C, 0.0, (c.1 as f32 + 0.5) * C);
+            // Stand in the open cell closest to the landmark's middle, facing it.
+            let mid = anchor(city, &name).unwrap_or_else(|| cells.iter().map(|&c| at(c)).sum::<Vec3>() / cells.len() as f32);
+            let c = *cells.iter().filter(|&&c| open(city, year, c)).min_by(|a, b| at(**a).distance(mid).total_cmp(&at(**b).distance(mid)))?;
+            let facing = Vec3::new(mid.x - at(c).x, 0.0, mid.z - at(c).z).normalize_or(Vec3::X);
+            Some(Stop { about: about(&name), name, stand: at(c), facing })
+        })
+        .collect();
+    // Nearest first, then nearest to the last one.
+    let mut out = vec![];
+    let mut here = start;
+    while !stops.is_empty() {
+        let k = (0..stops.len()).min_by(|&a, &b| stops[a].stand.distance(here).total_cmp(&stops[b].stand.distance(here))).unwrap();
+        let s = stops.swap_remove(k);
+        here = s.stand;
+        out.push(s);
+    }
+    out
+}
+
+/// Where a landmark itself is (not the lane beside it).
+fn anchor(city: &City, name: &str) -> Option<Vec3> {
+    let at = |c: Cell| Vec3::new((c.0 as f32 + 0.5) * C, 0.0, (c.1 as f32 + 0.5) * C);
+    if name == "South Gate" {
+        return Some(at(city.south_gate));
+    }
+    if name == "Yamen" {
+        let cells: Vec<Cell> = (0..city.d as u16).flat_map(|j| (0..city.w as u16).map(move |i| (i, j))).filter(|&c| city.ground_at(c) == Ground::Yamen).collect();
+        return (!cells.is_empty()).then(|| cells.iter().map(|&c| at(c)).sum::<Vec3>() / cells.len() as f32);
+    }
+    city.features.iter().find(|f| f.name.as_deref() == Some(name)).map(|f| at(f.cell))
+}
+
 /// Places you'd give directions by, and the open ground right at them.
 fn landmarks(city: &City) -> Vec<(String, Vec<Cell>)> {
     let mut out = vec![];

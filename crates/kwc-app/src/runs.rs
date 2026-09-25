@@ -82,6 +82,8 @@ pub enum Category {
     Rounds,
     /// Nothing but the street plaques: you find the way.
     Memory,
+    /// No clock, no bests: learn the course, with the route line (K).
+    Practice,
 }
 
 impl Category {
@@ -89,6 +91,7 @@ impl Category {
         match self {
             Category::Rounds => "Rounds",
             Category::Memory => "Memory",
+            Category::Practice => "Practice",
         }
     }
 }
@@ -115,6 +118,19 @@ impl Records {
 
     pub fn best(&self, course: Course, cat: Category) -> Option<&Vec<u32>> {
         self.best.get(&key(course, cat))
+    }
+
+    /// Eras open for racing: 1950, and each era after one you've finished a
+    /// race in (any course, any category).
+    pub fn unlocked(&self) -> Vec<u16> {
+        let done: Vec<u16> = self.best.keys().filter_map(|k| Course::parse(k.split(':').next()?).map(|c| c.era)).collect();
+        let mut out = vec![crate::game::ERAS[0]];
+        for w in crate::game::ERAS.windows(2) {
+            if done.contains(&w[0]) {
+                out.push(w[1]);
+            }
+        }
+        out
     }
 }
 
@@ -145,7 +161,7 @@ impl Run {
     }
 
     pub fn finished(&self) -> bool {
-        self.splits.len() >= DELIVERIES
+        self.cat != Category::Practice && self.splits.len() >= DELIVERIES
     }
 
     /// One simulation tick. The clock starts when you first move.
@@ -176,6 +192,9 @@ impl Run {
             return;
         }
         self.splits.push(self.ticks);
+        if self.cat == Category::Practice {
+            return;
+        }
         if self.finished() && self.best.as_ref().is_none_or(|b| self.ticks < *b.last().unwrap_or(&u32::MAX)) {
             self.new_best = true;
             records.best.insert(key(self.course, self.cat), self.splits.clone());
@@ -201,8 +220,18 @@ fn signed(d: f32) -> String {
 }
 
 /// The clock and splits (top left), and the results card once it's done.
-pub fn hud(ui: &mut egui::Ui, r: &Run) {
+pub fn hud(ui: &mut egui::Ui, r: &Run, route_key: &str, route_on: bool) {
     let paper = Color32::from_rgb(236, 228, 208);
+    if r.cat == Category::Practice {
+        egui::Area::new(egui::Id::new("run")).anchor(Align2::LEFT_TOP, [16.0, 16.0]).show(ui.ctx(), |ui| {
+            egui::Frame::new().fill(Color32::from_rgba_unmultiplied(20, 18, 16, 225)).inner_margin(12.0).corner_radius(4.0).show(ui, |ui| {
+                ui.colored_label(Color32::from_rgb(150, 200, 255), RichText::new(format!("{} · Practice", r.course.code())).small().monospace());
+                ui.colored_label(paper, RichText::new(format!("{} delivered", r.splits.len())).size(18.0));
+                ui.colored_label(Color32::from_gray(170), RichText::new(format!("{route_key}: route line {}", if route_on { "on" } else { "off" })).small());
+            });
+        });
+        return;
+    }
     egui::Area::new(egui::Id::new("run")).anchor(Align2::LEFT_TOP, [16.0, 16.0]).show(ui.ctx(), |ui| {
         egui::Frame::new().fill(Color32::from_rgba_unmultiplied(20, 18, 16, 225)).inner_margin(12.0).corner_radius(4.0).show(ui, |ui| {
             ui.colored_label(Color32::from_rgb(150, 200, 255), RichText::new(format!("{} · {}", r.course.code(), r.cat.name())).small().monospace());
@@ -274,6 +303,16 @@ mod tests {
         r.tick(true);
         assert_eq!(r.ticks, t, "the clock stops at the last delivery");
         assert_eq!(clock(120 * 65 + 30), "1:05.25");
+    }
+
+    #[test]
+    fn eras_open_one_after_another() {
+        let mut records = Records::default();
+        assert_eq!(records.unlocked(), vec![1950]);
+        records.best.insert("KWC-1950-0001:Memory".into(), vec![100]);
+        assert_eq!(records.unlocked(), vec![1950, 1955]);
+        records.best.insert("KWX-1960-BEEF:Rounds".into(), vec![100]);
+        assert_eq!(records.unlocked(), vec![1950, 1955, 1965], "1960 itself still needs 1955 finished");
     }
 
     #[test]
