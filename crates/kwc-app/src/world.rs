@@ -1,4 +1,4 @@
-//! The walkable city: one list of boxes that is both what you see inside and what
+﻿//! The walkable city: one list of boxes that is both what you see inside and what
 //! you collide with. Landings, corridors, walls with doorways, dog-leg stairs,
 //! stair huts, bridges, parapets, ladders, lanes built over at upper floors,
 //! unit doors and shopfronts.
@@ -193,7 +193,6 @@ pub fn landing_dir(plot: &Plot) -> Dir {
 const ALL: Faces = Faces::ALL;
 const TOP: Faces = Faces { top: true, bottom: false, px: false, nx: false, pz: false, nz: false };
 const BOTTOM: Faces = Faces { top: false, bottom: true, px: false, nx: false, pz: false, nz: false };
-const SIDES: Faces = Faces { top: false, bottom: false, px: true, nx: true, pz: true, nz: true };
 
 fn only(d: Dir) -> Faces {
     let mut f = Faces { top: false, bottom: false, px: false, nx: false, pz: false, nz: false };
@@ -403,22 +402,37 @@ fn corner_posts(b: &mut Builder, c: Cell, y0: f32, y1: f32, col: [f32; 3], open:
         if open(n1) && open(n2) && !diag_open {
             let x = if dx < 0 { (x0, x0 + WALL) } else { (x1 - WALL, x1) };
             let z = if dz < 0 { (z0, z0 + WALL) } else { (z1 - WALL, z1) };
-            b.solid(Aabb::new(Vec3::new(x.0, y0, z.0), Vec3::new(x.1, y1, z.1)), col, SIDES);
+            // Only the two faces pointing into this cell: the outward ones lie on
+            // the cell edge, flush with neighbours' walls or the facade.
+            let faces = Faces { top: false, bottom: false, px: dx < 0, nx: dx > 0, pz: dz < 0, nz: dz > 0 };
+            b.solid(Aabb::new(Vec3::new(x.0, y0, z.0), Vec3::new(x.1, y1, z.1)), col, faces);
         }
     }
 }
 
-/// Everything but the face towards `d`: walls against a facade or a neighbour's
-/// wall don't draw their outer side (it would fight with that surface).
-fn except(d: Dir) -> Faces {
-    let mut f = ALL;
-    match d {
-        Dir::N => f.nz = false,
-        Dir::S => f.pz = false,
-        Dir::E => f.px = false,
-        Dir::W => f.nx = false,
-    }
+/// The wall's inside and outside faces.
+fn both_faces(d: Dir) -> Faces {
+    let mut f = only(d);
+    let o = only(opposite(d));
+    f.px |= o.px;
+    f.nx |= o.nx;
+    f.pz |= o.pz;
+    f.nz |= o.nz;
     f
+}
+
+/// The end faces of a wall piece along face `d`: (low end, high end) of the
+/// along-face axis (x for N/S faces, z for E/W).
+fn along_ends(d: Dir) -> (Faces, Faces) {
+    let none = Faces { top: false, bottom: false, px: false, nx: false, pz: false, nz: false };
+    match d {
+        Dir::N | Dir::S => (Faces { nx: true, ..none }, Faces { px: true, ..none }),
+        Dir::E | Dir::W => (Faces { nz: true, ..none }, Faces { pz: true, ..none }),
+    }
+}
+
+fn or(a: Faces, o: Faces) -> Faces {
+    Faces { top: a.top | o.top, bottom: a.bottom | o.bottom, px: a.px | o.px, nx: a.nx | o.nx, pz: a.pz | o.pz, nz: a.nz | o.nz }
 }
 
 /// One storey of a landing or corridor cell: floor, ceiling, walls, doorways,
@@ -451,19 +465,25 @@ fn circulation_storey(b: &mut Builder, city: &City, c: Cell, pid: u32, f: i32, h
         }
         if n.is_some_and(|n| city.room_at(n, pid, fl)) {
             // A flat's wall: same thickness and plane as every other corridor wall,
-            // so corners meet cleanly.
-            b.solid(face_box(c, d, WALL, 0.0, C, y0, y1), col, except(d));
+            // so corners meet cleanly; only its inside face shows.
+            b.solid(face_box(c, d, WALL, 0.0, C, y0, y1), col, only(opposite(d)));
             continue;
         }
         let lane = n.is_some_and(|n| city.ground_at(n) == Ground::Alley);
         if (f == 0 && landing && lane) || bridge_through(c, d, f) {
-            // A doorway. The facade has a hole here, so the jambs draw all round.
+            // A doorway. The facade has a hole here, so the jambs show both faces
+            // and their reveals; the lintel shows its underside.
             let (a0, a1) = ((C - DOOR_W) / 2.0, (C + DOOR_W) / 2.0);
-            b.solid(face_box(c, d, WALL, 0.0, a0, y0, y1), col, ALL);
-            b.solid(face_box(c, d, WALL, a1, C, y0, y1), col, ALL);
-            b.solid(face_box(c, d, WALL, a0, a1, y0 + DOOR_H, y1), col, ALL);
+            let (lo_end, hi_end) = along_ends(d);
+            b.solid(face_box(c, d, WALL, 0.0, a0, y0, y1), col, or(both_faces(d), hi_end));
+            b.solid(face_box(c, d, WALL, a1, C, y0, y1), col, or(both_faces(d), lo_end));
+            let mut lintel = both_faces(d);
+            lintel.bottom = true;
+            b.solid(face_box(c, d, WALL, a0, a1, y0 + DOOR_H, y1), col, lintel);
         } else {
-            b.solid(face_box(c, d, WALL, 0.0, C, y0, y1), col, except(d));
+            // Just the inside face: the ends sit on the cell edge, flush with the
+            // next wall, a corner post or the facade.
+            b.solid(face_box(c, d, WALL, 0.0, C, y0, y1), col, only(opposite(d)));
         }
     }
     b.mesh.ao = 1.0;
@@ -482,21 +502,24 @@ fn stairwell(b: &mut Builder, city: &City, plot: &Plot, h: i32) {
     b.mesh.ao = 0.12;
     // Floor-level strip by the landing on every floor, the roof (inside the hut)
     // included; the ground floor's is the ground.
+    // Treads and landings stop at the walls' inner faces, so no face of theirs
+    // shares a plane with a wall's end (that's what flickered).
+    let (v0, v1, uf) = (WALL, WELL - WALL, WELL - WALL);
     for f in 1..=h {
         let y = f as f32 * S;
-        b.solid(w.bx(0.0, NEAR, 0.0, WELL, y - 0.3, y), step_col, ALL);
+        b.solid(w.bx(0.0, NEAR, v0, v1, y - 0.3, y), step_col, ALL);
     }
     for f in 0..h {
         let y = f as f32 * S;
         for k in 1..=RISERS {
             let kf = k as f32;
             let ta = y + kf * rise;
-            b.solid(w.bx(NEAR + (kf - 1.0) * tread, NEAR + kf * tread, 0.0, half, ta - 0.3, ta), step_col, ALL);
+            b.solid(w.bx(NEAR + (kf - 1.0) * tread, NEAR + kf * tread, v0, half, ta - 0.3, ta), step_col, ALL);
             let tb = y + S / 2.0 + kf * rise;
-            b.solid(w.bx(NEAR + RUN - kf * tread, NEAR + RUN - (kf - 1.0) * tread, half, WELL, tb - 0.3, tb), step_col, ALL);
+            b.solid(w.bx(NEAR + RUN - kf * tread, NEAR + RUN - (kf - 1.0) * tread, half, v1, tb - 0.3, tb), step_col, ALL);
         }
         let tl = y + S / 2.0;
-        b.solid(w.bx(NEAR + RUN, WELL, 0.0, WELL, tl - 0.3, tl), step_col, ALL);
+        b.solid(w.bx(NEAR + RUN, uf, v0, v1, tl - 0.3, tl), step_col, ALL);
         // A balustrade along the inside edge of each flight, stepping with it;
         // between the two you can see up and down the well.
         let rail = paint(plot.id, f);
@@ -528,7 +551,7 @@ fn stairwell(b: &mut Builder, city: &City, plot: &Plot, h: i32) {
                 if n.is_some_and(|n| cells.contains(&n) || (n == plot.core[0] && c == plot.core[1]) || (n == plot.core[5] && c == plot.core[3])) {
                     continue;
                 }
-                b.solid(face_box(c, d, WALL, 0.0, C, y0, y1), col, except(d));
+                b.solid(face_box(c, d, WALL, 0.0, C, y0, y1), col, only(opposite(d)));
             }
         }
     }

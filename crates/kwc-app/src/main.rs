@@ -10,6 +10,7 @@ mod game;
 mod lighting;
 mod lights;
 mod player;
+mod signtext;
 mod world;
 
 use citymesh::ColourMode;
@@ -22,7 +23,7 @@ use kwc_engine::winit::{
     keyboard::{KeyCode, PhysicalKey},
     window::{CursorGrabMode, Window, WindowId},
 };
-use kwc_engine::{egui, Camera, FrameParams, GpuMesh, Gpu, Gui, OrbitCamera, Renderer};
+use kwc_engine::{egui, Camera, FrameParams, GpuMesh, Gpu, Gui, OrbitCamera, Renderer, TextMesh};
 use kwc_sim::*;
 use std::collections::HashSet;
 use std::sync::Arc;
@@ -79,17 +80,36 @@ struct Walk {
     year: u16,
     spots: Vec<game::Spot>,
     plates: Vec<game::Plate>,
+    /// Every name, painted on the city.
+    text: Option<TextMesh>,
+    /// The current job's two doors, painted again in their highlight colours.
+    job_text: Option<TextMesh>,
+    job_key: Option<(u32, u32, bool)>,
 }
 
 impl Walk {
-    fn new(gpu: &Gpu, city: &City, soc: &society::Society, year: u16) -> Walk {
+    fn new(gpu: &Gpu, renderer: &mut Renderer, signs: &signtext::SignText, city: &City, soc: &society::Society, year: u16) -> Walk {
         let t = Instant::now();
         let (world, mut mesh) = world::build(city, year);
         let lamps = lights::collect(city, year);
         lights::bake(city, year, &lamps, &mut [&mut mesh]);
         log::info!("walk world {year}: {} boxes, {} verts in {:.0?}", world.boxes.len(), mesh.vertices.len(), t.elapsed());
         let player = player::Player::new(world.spawn, world.spawn_yaw);
-        Walk { interior: GpuMesh::upload_chunked(&gpu.device, &mesh), world, player, year, spots: game::spots(city, soc, year), plates: game::plates(city, soc, year) }
+        let plates = game::plates(city, soc, year);
+        let (tv, ti) = signs.build(&plates, None, None);
+        let (aw, ah, atlas) = signs.atlas();
+        renderer.set_text_atlas(gpu, aw, ah, &atlas);
+        Walk {
+            interior: GpuMesh::upload_chunked(&gpu.device, &mesh),
+            world,
+            player,
+            year,
+            spots: game::spots(city, soc, year),
+            text: TextMesh::upload(&gpu.device, &tv, &ti),
+            plates,
+            job_text: None,
+            job_key: None,
+        }
     }
 }
 
@@ -126,6 +146,7 @@ struct App {
     walk: Option<Walk>,
     /// The delivery game (None = free roaming).
     game: Option<game::Game>,
+    signs: signtext::SignText,
     keys: HashSet<KeyCode>,
     drag: Option<MouseButton>,
     last_cursor: Option<(f64, f64)>,
@@ -239,10 +260,10 @@ impl App {
     }
 
     fn enter_walk(&mut self) {
-        let run = self.run.as_ref().unwrap();
+        let run = self.run.as_mut().unwrap();
         let year = self.game.as_ref().map_or(self.settings.year.floor() as u16, |g| g.year);
         self.settings.playing = false;
-        self.walk = Some(Walk::new(&run.gpu, &self.world.city, &self.world.society, year));
+        self.walk = Some(Walk::new(&run.gpu, &mut run.renderer, &self.signs, &self.world.city, &self.world.society, year));
         let w = &run.window;
         let _ = w.set_cursor_grab(CursorGrabMode::Locked).or_else(|_| w.set_cursor_grab(CursorGrabMode::Confined));
         w.set_cursor_visible(false);
@@ -291,6 +312,18 @@ impl App {
                 g.new_job(&self.world.city, &self.world.society);
             }
         }
+        if let (Some(w), Some(run)) = (self.walk.as_mut(), self.run.as_ref()) {
+            let key = self.game.as_ref().and_then(|g| g.job.as_ref()).map(|j| (j.from, j.to, j.picked));
+            if key != w.job_key {
+                w.job_key = key;
+                w.job_text = key.and_then(|(from, to, picked)| {
+                    let (unit, tint) = if picked { (to, [255, 205, 90]) } else { (from, [120, 240, 150]) };
+                    let ids: Vec<usize> = w.plates.iter().enumerate().filter(|(_, p)| p.kind == game::SpotKind::Unit(unit)).map(|(k, _)| k).collect();
+                    let (v, i) = self.signs.build(&w.plates, Some(&ids), Some(tint));
+                    TextMesh::upload(&run.gpu.device, &v, &i)
+                });
+            }
+        }
 
         let s = &mut self.settings;
         if s.playing {
@@ -325,7 +358,8 @@ impl App {
             }
             None => lighting::params(&self.orbit.camera(), run.gpu.aspect(), s.night),
         };
-        run.renderer.render(&run.gpu, &mut enc, &view, &meshes, &params);
+        let texts: Vec<&TextMesh> = self.walk.as_ref().map_or(vec![], |w| w.text.iter().chain(w.job_text.iter()).collect());
+        run.renderer.render_with_text(&run.gpu, &mut enc, &view, &meshes, &texts, &params);
 
         let stats = stats::measure(&self.world.city, year);
         let fps = self.fps;
@@ -355,9 +389,6 @@ struct Label {
 struct HudInfo {
     place: String,
     labels: Vec<Label>,
-    /// Visible painted text, nearest first, with the camera to project it.
-    plates: Vec<usize>,
-    view_proj: glam::Mat4,
     /// Addresses for the job card.
     from_addr: String,
     to_addr: String,
@@ -442,28 +473,8 @@ fn hud_info(wd: &World, w: &Walk, g: Option<&game::Game>, params: &FrameParams, 
         let what = if j.picked { "Deliver" } else { "Collect" };
         Some((angle, format!("{what} · {dist:.0} m{vertical}")))
     });
-    // Painted text worth drawing: close, facing us, not behind a wall.
-    let mut plates: Vec<(f32, usize)> = w
-        .plates
-        .iter()
-        .enumerate()
-        .filter_map(|(k, pl)| {
-            let to_eye = cam.eye - pl.centre;
-            let dist = to_eye.length();
-            let ok = dist < 11.0 && pl.normal.dot(to_eye) > 0.05 && (pl.centre - cam.eye).normalize().dot(look) > 0.2;
-            let _ = memory;
-            ok.then_some((dist, k))
-        })
-        .collect();
-    plates.sort_by(|a, b| a.0.total_cmp(&b.0));
-    let plates: Vec<usize> = plates
-        .into_iter()
-        .filter(|&(_, k)| game::line_clear(&w.world, cam.eye, w.plates[k].centre + w.plates[k].normal * 0.12))
-        .take(40)
-        .map(|(_, k)| k)
-        .collect();
     let place = if memory { "Memory mode · plaques only (G to turn off)".to_string() } else { game::place_name(city, soc, year, w.player.pos) };
-    HudInfo { place, labels, plates, view_proj: params.view_proj, from_addr, to_addr, arrow }
+    HudInfo { place, labels, from_addr, to_addr, arrow }
 }
 
 fn hud(ui: &mut egui::Ui, w: &Walk, s: &Settings, g: Option<&game::Game>, info: &HudInfo, fps: f32) {
@@ -502,55 +513,6 @@ fn hud(ui: &mut egui::Ui, w: &Walk, s: &Settings, g: Option<&game::Game>, info: 
         y += ts.y;
         let ss = sub.size();
         painter.galley(Pos2::new(pos.x - ss.x / 2.0, y), sub, paper);
-    }
-
-    // Names painted on the city: each glyph pinned in 3D and projected.
-    let tex = ui.ctx().fonts(|f| f.font_image_size());
-    let uvn = egui::vec2(1.0 / tex[0] as f32, 1.0 / tex[1] as f32);
-    let to_screen = |p: Vec3| -> Option<Pos2> {
-        let c = info.view_proj * p.extend(1.0);
-        (c.w > 0.05).then(|| Pos2::new(screen.left() + (c.x / c.w * 0.5 + 0.5) * screen.width(), screen.top() + (0.5 - c.y / c.w * 0.5) * screen.height()))
-    };
-    let job_target = |kind: game::SpotKind| -> Option<Color32> {
-        let j = g?.job.as_ref()?;
-        match kind {
-            game::SpotKind::Unit(u) if !j.picked && u == j.from => Some(Color32::from_rgb(120, 240, 150)),
-            game::SpotKind::Unit(u) if j.picked && u == j.to => Some(Color32::from_rgb(255, 205, 90)),
-            _ => None,
-        }
-    };
-    for &k in &info.plates {
-        let pl = &w.plates[k];
-        let colour = job_target(pl.kind).unwrap_or(Color32::from_rgb(pl.colour[0], pl.colour[1], pl.colour[2]));
-        let galleys: Vec<_> = pl.lines.iter().filter(|l| !l.is_empty()).map(|l| painter.layout_no_wrap(l.clone(), FontId::proportional(28.0), colour)).collect();
-        if galleys.is_empty() {
-            continue;
-        }
-        let gh = galleys[0].size().y;
-        let widest = galleys.iter().map(|g| g.size().x).fold(0.0, f32::max);
-        let s = (pl.line_h / gh).min(pl.max_w / widest.max(1.0));
-        let total_h = gh * s * galleys.len() as f32;
-        let mut mesh = egui::Mesh::with_texture(egui::TextureId::default());
-        let mut ok = true;
-        for (li, gal) in galleys.iter().enumerate() {
-            let origin = pl.centre - pl.right * (gal.size().x * s / 2.0) + Vec3::Y * (total_h / 2.0 - li as f32 * gh * s);
-            for row in &gal.rows {
-                let base = mesh.vertices.len() as u32;
-                for v in &row.visuals.mesh.vertices {
-                    let gp = row.pos + v.pos.to_vec2();
-                    let world = origin + pl.right * (gp.x * s) - Vec3::Y * (gp.y * s);
-                    let Some(sp) = to_screen(world) else {
-                        ok = false;
-                        break;
-                    };
-                    mesh.vertices.push(egui::epaint::Vertex { pos: sp, uv: Pos2::new(v.uv.x * uvn.x, v.uv.y * uvn.y), color: colour });
-                }
-                mesh.indices.extend(row.visuals.mesh.indices.iter().map(|i| i + base));
-            }
-        }
-        if ok {
-            painter.add(egui::Shape::mesh(mesh));
-        }
     }
 
     // Where you are.
@@ -724,11 +686,13 @@ fn screenshot(args: &[String], out: &str) {
     let mut renderer = Renderer::new(&gpu);
     let mut world = World::new(seed);
     world.ensure_mesh(&gpu, year, mode);
-    let walk;
+    let walk: Option<Walk>;
     let mut meshes: Vec<&GpuMesh> = world.mesh.iter().collect();
     let params = if args.iter().any(|a| a == "--walk") {
-        walk = Walk::new(&gpu, &world.city, &world.society, year);
-        let mut p = player::Player::new(walk.world.spawn, walk.world.spawn_yaw);
+        let signs = signtext::SignText::new();
+        walk = Some(Walk::new(&gpu, &mut renderer, &signs, &world.city, &world.society, year));
+        let wk = walk.as_ref().unwrap();
+        let mut p = player::Player::new(wk.world.spawn, wk.world.spawn_yaw);
         if let Some(n) = arg::<usize>(args, "--lane") {
             let lane = world.city.lanes.get(n);
             println!("lane: {}", lane.map_or("?", |l| l.name.as_str()));
@@ -767,9 +731,10 @@ fn screenshot(args: &[String], out: &str) {
                 (p.yaw, p.pitch) = (v[3], v[4]);
             }
         }
-        meshes.extend(walk.interior.iter());
+        meshes.extend(wk.interior.iter());
         walk_params(&p.camera(), gpu.aspect(), night, args.iter().any(|a| a == "--torch"))
     } else {
+        walk = None;
         let mut orbit = default_orbit(&world.city);
         if let Some(v) = arg::<String>(args, "--view").map(|v| floats(&v)) {
             if v.len() == 3 {
@@ -778,7 +743,8 @@ fn screenshot(args: &[String], out: &str) {
         }
         lighting::params(&orbit.camera(), gpu.aspect(), night)
     };
-    let (w, h, px) = renderer.capture(&gpu, &meshes, &params);
+    let texts: Vec<&TextMesh> = walk.as_ref().map_or(vec![], |w| w.text.iter().collect());
+    let (w, h, px) = renderer.capture_with_text(&gpu, &meshes, &texts, &params);
     image::RgbaImage::from_raw(w, h, px).unwrap().save(out).expect("save png");
     println!("wrote {out}");
 }
@@ -816,6 +782,7 @@ fn main() {
         orbit,
         walk: None,
         game,
+        signs: signtext::SignText::new(),
         keys: HashSet::new(),
         drag: None,
         last_cursor: None,
@@ -902,5 +869,78 @@ mod tests {
             }
         }
         assert!(ok >= 8, "only {ok}/10 ladders climbed");
+    }
+
+    /// Z-fighting detector: coplanar faces pointing the same way that overlap.
+    /// Checks a sample of whole buildings, inside and out.
+    #[test]
+    fn no_visible_z_fighting() {
+        use std::collections::HashMap;
+        let city = generate(&Params::default());
+        let (walk, mut mesh) = world::build(&city, END_YEAR);
+        // Inside and outside meet at walls: check both meshes together.
+        mesh.append(&citymesh::build(&city, END_YEAR, citymesh::ColourMode::Grime));
+        // Areas to check: a few tall buildings' stair cores.
+        let areas: Vec<(Vec3, Vec3)> = city
+            .plots
+            .iter()
+            .filter(|p| p.final_height() >= 8)
+            .take(6)
+            .map(|p| {
+                let xs = p.cells.iter().map(|c| c.0 as f32 * CELL_M);
+                let zs = p.cells.iter().map(|c| c.1 as f32 * CELL_M);
+                let (x0, x1) = (xs.clone().fold(f32::MAX, f32::min) - 0.1, xs.fold(f32::MIN, f32::max) + CELL_M + 0.1);
+                let (z0, z1) = (zs.clone().fold(f32::MAX, f32::min) - 0.1, zs.fold(f32::MIN, f32::max) + CELL_M + 0.1);
+                (Vec3::new(x0, -1.0, z0), Vec3::new(x1, 60.0, z1))
+            })
+            .collect();
+        let inside = |p: Vec3| areas.iter().any(|(a, b)| p.cmpge(*a).all() && p.cmple(*b).all());
+        // Bucket axis-aligned quads by (axis, facing, plane offset).
+        let mut buckets: HashMap<(usize, bool, i64), Vec<([f32; 2], [f32; 2], [f32; 3])>> = HashMap::new();
+        for q in mesh.vertices.chunks_exact(4) {
+            let n = Vec3::from(q[0].normal);
+            let Some(axis) = (0..3).find(|&k| n[k].abs() > 0.99) else { continue };
+            let pts: Vec<Vec3> = q.iter().map(|v| Vec3::from(v.pos)).collect();
+            let c = (pts[0] + pts[2]) * 0.5;
+            if !inside(c) {
+                continue;
+            }
+            let (a, b) = ((axis + 1) % 3, (axis + 2) % 3);
+            let lo = [pts.iter().map(|p| p[a]).fold(f32::MAX, f32::min), pts.iter().map(|p| p[b]).fold(f32::MAX, f32::min)];
+            let hi = [pts.iter().map(|p| p[a]).fold(f32::MIN, f32::max), pts.iter().map(|p| p[b]).fold(f32::MIN, f32::max)];
+            let key = (axis, n[axis] > 0.0, (pts[0][axis] * 1000.0).round() as i64);
+            buckets.entry(key).or_default().push((lo, hi, q[0].color));
+        }
+        let mut hits = vec![];
+        for (key, qs) in &buckets {
+            for i in 0..qs.len() {
+                for j in i + 1..qs.len() {
+                    let (a, b) = (&qs[i], &qs[j]);
+                    let w = a.1[0].min(b.1[0]) - a.0[0].max(b.0[0]);
+                    let h = a.1[1].min(b.1[1]) - a.0[1].max(b.0[1]);
+                    if w > 0.01 && h > 0.01 && a.2 != b.2 {
+                        // Only surfaces you can see flicker: skip overlaps whose front
+                        // side is buried inside something solid.
+                        let (ax, bx) = ((key.0 + 1) % 3, (key.0 + 2) % 3);
+                        let mut p = Vec3::ZERO;
+                        p[key.0] = key.2 as f32 / 1000.0 + if key.1 { 0.01 } else { -0.01 };
+                        p[ax] = (a.0[0].max(b.0[0]) + a.1[0].min(b.1[0])) / 2.0;
+                        p[bx] = (a.0[1].max(b.0[1]) + a.1[1].min(b.1[1])) / 2.0;
+                        if walk.blocked(&world::Aabb::new(p - Vec3::splat(0.002), p + Vec3::splat(0.002))) {
+                            continue;
+                        }
+                        if std::env::var("ZDEBUG").is_ok() && hits.len() < 5 {
+                            let c = ((p.x / CELL_M) as u16, (p.z / CELL_M) as u16);
+                            eprintln!("  front {p:?} cell {c:?} {:?} | A {:?}-{:?} | B {:?}-{:?}", city.ground_at(c), a.0, a.1, b.0, b.1);
+                        }
+                        hits.push((*key, w * h, a.2, b.2));
+                    }
+                }
+            }
+        }
+        for h in hits.iter().take(12) {
+            eprintln!("coplanar overlap: axis {} +{} at {:.3} m, {:.3} m2, colours {:?} / {:?}", h.0 .0, h.0 .1, h.0 .2 as f32 / 1000.0, h.1, h.2, h.3);
+        }
+        assert!(hits.is_empty(), "{} visible z-fighting overlaps", hits.len());
     }
 }

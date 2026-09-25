@@ -14,7 +14,7 @@ pub use camera::{Camera, OrbitCamera};
 pub use gpu::Gpu;
 pub use gui::Gui;
 pub use mesh::{GpuMesh, MeshData, Vertex};
-pub use renderer::{FrameParams, Renderer};
+pub use renderer::{FrameParams, Renderer, TextMesh, TextVertex};
 
 pub use egui;
 pub use glam;

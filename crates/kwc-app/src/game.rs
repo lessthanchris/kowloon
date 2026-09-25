@@ -221,7 +221,6 @@ impl Game {
 /// in-plane right/up directions (as a reader facing the wall sees them).
 pub struct Plate {
     pub centre: Vec3,
-    pub normal: Vec3,
     pub right: Vec3,
     pub lines: Vec<String>,
     /// Height of one line of text, and the widest it may be (m).
@@ -255,7 +254,7 @@ pub fn plates(city: &City, soc: &Society, year: u16) -> Vec<Plate> {
                 Some(&o) => soc.describe(o),
                 None => continue,
             };
-            out.push(Plate { centre: p + n * 0.045 + Vec3::Y * (y + 2.63), normal: n, right, lines: vec![name], line_h: 0.17, max_w: 1.3, colour: [245, 232, 200], kind: SpotKind::Unit(u.id) });
+            out.push(Plate { centre: p + n * 0.045 + Vec3::Y * (y + 2.63), right, lines: vec![name], line_h: 0.17, max_w: 1.3, colour: [245, 232, 200], kind: SpotKind::Unit(u.id) });
         } else {
             let flat = format!("{}{}", u.floor, a.flat.unwrap_or(' '));
             let who = match occ.first() {
@@ -265,7 +264,6 @@ pub fn plates(city: &City, soc: &Society, year: u16) -> Vec<Plate> {
             };
             out.push(Plate {
                 centre: p + n * 0.15 + Vec3::Y * (y + 1.55),
-                normal: n,
                 right,
                 lines: vec![flat, who],
                 line_h: 0.11,
@@ -282,7 +280,6 @@ pub fn plates(city: &City, soc: &Society, year: u16) -> Vec<Plate> {
             let (lane, num) = soc.directory.building[pl.id as usize];
             out.push(Plate {
                 centre: p + n * 0.03 + Vec3::Y * 2.45,
-                normal: n,
                 right,
                 lines: vec![format!("{num} {}", soc.directory.lane_names[lane as usize])],
                 line_h: 0.13,
@@ -297,7 +294,6 @@ pub fn plates(city: &City, soc: &Society, year: u16) -> Vec<Plate> {
         let c = (b.min + b.max) * 0.5;
         out.push(Plate {
             centre: c + out_dir * 0.02,
-            normal: out_dir,
             right,
             lines: vec![soc.directory.lane_names[lane as usize].clone()],
             line_h: 0.11,

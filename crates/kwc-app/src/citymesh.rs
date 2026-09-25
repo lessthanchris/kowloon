@@ -87,10 +87,12 @@ fn openings(city: &City, year: u16) -> std::collections::HashSet<(Cell, Dir, i32
         if p.height_at(year) == 0 {
             continue;
         }
-        let l = p.core[0];
-        for (d, n) in city.neighbours(l) {
-            if city.ground_at(n) == Ground::Alley {
-                o.insert((l, d, 0));
+        // Both landing cells open onto the lane at street level.
+        for l in [p.core[0], p.core[5]] {
+            for (d, n) in city.neighbours(l) {
+                if city.ground_at(n) == Ground::Alley {
+                    o.insert((l, d, 0));
+                }
             }
         }
     }
