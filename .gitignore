@@ -1,4 +1,11 @@
 /target
 /dumps*
 
+# Player data, written next to the game
 /save.json
+/save-*.json
+/runs.json
+/ghosts/
+
+# Release packaging
+/dist/
