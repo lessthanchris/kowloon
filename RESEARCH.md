@@ -43,3 +43,16 @@
 - **Lanes covered overhead.** Upper floors built over the lanes, and light rarely reached the ground. The renderer should close lanes over at upper floors.
 - **Trades by street.** Lo Yan Street roast meats; fishball makers off Kwong Ming Street ("Electric Station", with stalls selling cheap drugs). Unit uses are currently random by floor and frontage.
 - **Population history.** Census counts were 10,004 (1971) and 14,617 (1981), widely thought to undercount; the 1987 estimate was 33,000. The growth curve is invented to hit the 1987 end state.
+
+## City of Darkness (Girard & Lambot, 1993): vibe reference for now
+Used as a visual and atmosphere reference only; the generator isn't fitted to it yet. For a future accurate-map pass:
+- **"The Map" (book pp. 214–215)** is a full ground plan: every building footprint, every named lane, the Yamen compound, and numbered places (standpipe 30, well 34, Tin Hau Temple 31, Fuk Tak Temple 12, Old People's Centre 26, Old School 27, St Stephen's 28). `tools/trace_map.py` already splits it into lanes and building pieces; it still needs merging and georeferencing (rotated about 15° from north; the Yamen compound is about 30 × 53 m on the map against 26 × 50 m in OSM).
+- **Japanese survey cross-section** (east to west): Lung Shing Road is the east-side main passage, just inside the east wall, "one of the few lanes that gets daylight". Then dead-end passages, Kwong Ming Street (main), the Lung Chun 1st and 2nd Lanes, and Lo Yan Street (main, western half). There are open-air rubbish collection points at ground level.
+- **Look and feel:**
+  - the edge is a sheer 13–14-storey wall, with lower, ragged roofs inside;
+  - the Yamen sits in an open pit;
+  - roofs are a forest of TV aerials, with gardens, shacks and water tanks, and wiring runs down the walls;
+  - facades are all cages, balconies and laundry;
+  - shops have concertina shutters;
+  - corridors and interiors are lit by fluorescent tubes (green-white), with pink walls inside.
+- **Trades seen:** roast pork, noodles, bakery and steamed buns, toy plastics, textiles, toilet paper, sheet metal, herbalists, dentists (dentures in the window), mahjong on the 2nd–3rd floors, canteens, a triad office, an estate agent, and an elderly centre.
