@@ -12,6 +12,7 @@ struct Uniforms {
     fog_col: vec4<f32>,
     fog: vec4<f32>,       // x density, y height falloff, z fog base height, w emissive gain
     misc: vec4<f32>,      // x canyon depth (m) for ground darkening, y darkening strength
+    torch: vec4<f32>,     // rgb colour * intensity, w range (m); 0 = off
 };
 
 @group(0) @binding(0) var<uniform> u: Uniforms;
@@ -21,6 +22,7 @@ struct VIn {
     @location(1) normal: vec3<f32>,
     @location(2) color: vec3<f32>,
     @location(3) emit: f32,
+    @location(4) ao: f32,
 };
 
 struct VOut {
@@ -29,6 +31,7 @@ struct VOut {
     @location(1) normal: vec3<f32>,
     @location(2) color: vec3<f32>,
     @location(3) emit: f32,
+    @location(4) ao: f32,
 };
 
 @vertex
@@ -39,6 +42,7 @@ fn vs_main(v: VIn) -> VOut {
     o.normal = v.normal;
     o.color = v.color;
     o.emit = v.emit;
+    o.ao = v.ao;
     return o;
 }
 
@@ -49,12 +53,19 @@ fn fs_main(i: VOut) -> @location(0) vec4<f32> {
     let sun = max(dot(n, u.sun_dir.xyz), 0.0) * u.sun_col.rgb;
     // Near the ground the sky is a slot between walls: darken towards y = 0.
     let canyon = clamp(i.world.y / max(u.misc.x, 0.001), 0.0, 1.0);
-    let occl = mix(1.0 - u.misc.y, 1.0, canyon);
+    let occl = mix(1.0 - u.misc.y, 1.0, canyon) * i.ao;
     // Emissive surfaces (windows, signs) are dark glass lit from within: their
     // colour is the light's, so it only shows through the emissive term.
     let glass = clamp(i.emit, 0.0, 1.0);
     let albedo = mix(i.color, vec3<f32>(0.018, 0.02, 0.024), glass);
     var c = albedo * (hemi + sun) * occl + i.color * i.emit * u.fog.w;
+    // Head torch: a soft point light at the eye.
+    if (u.torch.w > 0.0) {
+        let to_eye = u.cam_pos.xyz - i.world;
+        let dist = length(to_eye);
+        let fall = clamp(1.0 - dist / u.torch.w, 0.0, 1.0);
+        c += albedo * u.torch.rgb * max(dot(n, to_eye / max(dist, 0.001)), 0.0) * fall * fall;
+    }
 
     let d = distance(i.world, u.cam_pos.xyz);
     let h = exp(-max(i.world.y - u.fog.z, 0.0) * u.fog.y);

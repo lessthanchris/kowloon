@@ -67,8 +67,19 @@ pub fn grow(city: &mut City) {
         })
         .collect();
 
-    for p in &mut city.plots {
-        p.ambition = if rng.gen::<f32>() < 0.55 { MAX_FLOORS as u8 } else { rng.gen_range(10..=13) };
+    // Silhouette (aerials, the park's bronze model): the edge is a sheer wall at
+    // the cap; inside, roofs are lower and ragged.
+    for (p, plot) in city.plots.iter_mut().enumerate() {
+        let r = rng.gen::<f32>();
+        plot.ambition = if frontage[p] {
+            if r < 0.8 { MAX_FLOORS as u8 } else { 13 }
+        } else if r < 0.25 {
+            MAX_FLOORS as u8
+        } else if r < 0.92 {
+            rng.gen_range(10..=13)
+        } else {
+            rng.gen_range(7..=9)
+        };
     }
 
     let mut heights = vec![0u8; n];

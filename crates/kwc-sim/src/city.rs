@@ -23,13 +23,17 @@ pub enum Ground {
 pub enum Role {
     None,
     Room,
-    /// Stair core: runs from the ground to the roof.
+    /// Stair landing: entered from the lane at ground level; doors and corridors
+    /// attach here on every floor.
     Core,
+    /// Stair shaft beside the landing: a steep dog-leg from each floor to the next,
+    /// ending in a stair hut on the roof.
+    Stair,
     /// Landing/corridor linking rooms to the core.
     Corridor,
 }
 
-#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash, Serialize, Deserialize)]
 pub enum Dir {
     N,
     E,
@@ -73,7 +77,7 @@ pub struct Feature {
 pub struct Plot {
     pub id: u32,
     pub cells: Vec<Cell>,
-    /// Stair core cells; `core[0]` opens onto a lane at ground level.
+    /// `core[0]` is the landing (opens onto a lane at ground level), `core[1]` the stair.
     pub core: Vec<Cell>,
     /// Year the plot was first built on (0 = never).
     pub founded: u16,

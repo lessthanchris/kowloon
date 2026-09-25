@@ -55,6 +55,7 @@ pub fn render_map(city: &City, year: u16, mode: MapMode) -> RgbImage {
                     } else {
                         match city.role_at(c) {
                             Role::Core => [220, 150, 50],
+                            Role::Stair => [250, 200, 90],
                             Role::Corridor => [140, 100, 50],
                             _ => [200, 200, 190],
                         }

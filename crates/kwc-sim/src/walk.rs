@@ -61,11 +61,21 @@ pub fn reachable(city: &City, year: u16) -> HashSet<Node> {
                         }
                     }
                 }
-                if city.role_at(c) == Role::Core {
-                    next.push((c, lv + 1)); // up (lv+1 == h is the roof)
-                    if lv > 0 {
-                        next.push((c, lv - 1));
+                // Landing <-> stair: the stair at floor lv climbs from landing lv to
+                // landing lv+1 (lv+1 == h is the roof).
+                let plot = &city.plots[pid as usize];
+                match city.role_at(c) {
+                    Role::Core => {
+                        next.push((plot.core[1], lv));
+                        if lv > 0 {
+                            next.push((plot.core[1], lv - 1));
+                        }
                     }
+                    Role::Stair => {
+                        next.push((plot.core[0], lv));
+                        next.push((plot.core[0], lv + 1));
+                    }
+                    _ => {}
                 }
                 for b in &bridges {
                     if b.floor == lv {
@@ -89,7 +99,7 @@ pub fn reachable(city: &City, year: u16) -> HashSet<Node> {
                     }
                 }
                 if city.role_at(c) == Role::Core {
-                    next.push((c, lv - 1));
+                    next.push((city.plots[pid as usize].core[1], lv - 1));
                 }
             }
             _ => {}

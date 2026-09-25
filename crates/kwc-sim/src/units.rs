@@ -43,7 +43,7 @@ fn floor_units(city: &City, p: usize, floor: u8, rng: &mut impl Rng, out: &mut V
             continue;
         }
         let g = groups.len();
-        let size = rng.gen_range(13..=28); // ~23 m² average flat (1987 survey)
+        let size = rng.gen_range(16..=32); // ~23 m² average flat (1987 survey)
         let mut cells = vec![start];
         owner.insert(start, g);
         let mut q = VecDeque::from([start]);
@@ -78,7 +78,35 @@ fn floor_units(city: &City, p: usize, floor: u8, rng: &mut impl Rng, out: &mut V
         }
     }
 
-    for cells in groups {
+    // Pokey leftovers (under ~18 m²) knock through into their smallest neighbour.
+    const MIN_UNIT: usize = 8;
+    let mut lonely = std::collections::HashSet::new();
+    while let Some(g) = (0..groups.len()).find(|&g| !groups[g].is_empty() && groups[g].len() < MIN_UNIT && !lonely.contains(&g)) {
+        let mut best: Option<usize> = None;
+        for &c in &groups[g] {
+            for (_, n) in city.neighbours(c) {
+                if let Some(&o) = owner.get(&n) {
+                    if o != g && best.map_or(true, |b| groups[o].len() < groups[b].len()) {
+                        best = Some(o);
+                    }
+                }
+            }
+        }
+        match best {
+            Some(o) => {
+                let cells = std::mem::take(&mut groups[g]);
+                for &c in &cells {
+                    owner.insert(c, o);
+                }
+                groups[o].extend(cells);
+            }
+            None => {
+                lonely.insert(g); // nothing to join: stays a tiny room
+            }
+        }
+    }
+
+    for cells in groups.into_iter().filter(|g| !g.is_empty()) {
 
         // Door: onto the lane for ground-floor frontage (usually), else onto the landing.
         let mut alley_doors = vec![];

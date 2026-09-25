@@ -21,6 +21,9 @@ pub struct FrameParams {
     pub emissive_gain: f32,
     pub canyon_depth: f32,
     pub canyon_strength: f32,
+    /// Head torch colour (pre-multiplied intensity) and range in metres; range 0 = off.
+    pub torch_col: Vec3,
+    pub torch_range: f32,
 }
 
 #[repr(C)]
@@ -35,6 +38,7 @@ struct Uniforms {
     fog_col: [f32; 4],
     fog: [f32; 4],
     misc: [f32; 4],
+    torch: [f32; 4],
 }
 
 fn v4(v: Vec3, w: f32) -> [f32; 4] {
@@ -164,6 +168,7 @@ impl Renderer {
             fog_col: v4(p.fog_col, 0.0),
             fog: [p.fog_density, p.fog_height_falloff, p.fog_base, p.emissive_gain],
             misc: [p.canyon_depth, p.canyon_strength, 0.0, 0.0],
+            torch: v4(p.torch_col, p.torch_range),
         };
         gpu.queue.write_buffer(&self.ubuf, 0, bytemuck::bytes_of(&u));
         let fc = p.fog_col;

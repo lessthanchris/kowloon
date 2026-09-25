@@ -70,9 +70,50 @@ fn col_height(city: &City, c: Cell, year: u16) -> f32 {
     }
 }
 
+pub fn near_yamen(city: &City, c: Cell) -> bool {
+    (-1..=1).any(|dj: i32| {
+        (-1..=1).any(|di: i32| {
+            let (i, j) = (c.0 as i32 + di, c.1 as i32 + dj);
+            city.in_bounds(i, j) && city.ground_at((i as u16, j as u16)) == Ground::Yamen
+        })
+    })
+}
+
+/// Storey faces left open in facades: ground-floor stair entrances onto lanes,
+/// and bridge ends.
+fn openings(city: &City, year: u16) -> std::collections::HashSet<(Cell, Dir, i32)> {
+    let mut o = std::collections::HashSet::new();
+    for p in &city.plots {
+        if p.height_at(year) == 0 {
+            continue;
+        }
+        let l = p.core[0];
+        for (d, n) in city.neighbours(l) {
+            if city.ground_at(n) == Ground::Alley {
+                o.insert((l, d, 0));
+            }
+        }
+    }
+    let dir = |a: Cell, b: Cell| Dir::ALL.into_iter().find(|&d| city.step(a, d) == Some(b));
+    for br in city.bridges.iter().filter(|b| b.year <= year) {
+        let fa = br.span.first().copied().unwrap_or(br.b);
+        let fb = br.span.last().copied().unwrap_or(br.a);
+        if let Some(d) = dir(br.a, fa) {
+            o.insert((br.a, d, br.floor as i32));
+        }
+        if let Some(d) = dir(br.b, fb) {
+            o.insert((br.b, d, br.floor as i32));
+        }
+    }
+    o
+}
+
 pub fn build(city: &City, year: u16, mode: ColourMode) -> MeshData {
     let mut m = MeshData::default();
     let s = CELL_M;
+    let holes = openings(city, year);
+    let over: std::collections::HashMap<Cell, (f32, f32)> =
+        crate::world::overbuild(city, year).into_iter().map(|(c, a, t)| (c, (a, t))).collect();
 
     // Surroundings: a dark plane under everything.
     let (w, d) = (city.w as f32 * s, city.d as f32 * s);
@@ -106,7 +147,12 @@ pub fn build(city: &City, year: u16, mode: ColourMode) -> MeshData {
                     _ => srgb(58, 62, 44), // empty plot: scrub and huts' footprints
                 };
                 let n = 0.9 + 0.2 * hash(i as u32, j as u32, 3);
+                m.ao = if over.contains_key(&c) { 0.35 } else { 1.0 };
                 m.quad([Vec3::new(x0, 0.0, z0), Vec3::new(x0, 0.0, z1), Vec3::new(x1, 0.0, z1), Vec3::new(x1, 0.0, z0)], mul(col, n), 0.0);
+                m.ao = 1.0;
+                if let Some(&(y0, y1)) = over.get(&c) {
+                    overbuild_box(&mut m, city, c, y0, y1, &over);
+                }
                 continue;
             }
 
@@ -123,8 +169,10 @@ pub fn build(city: &City, year: u16, mode: ColourMode) -> MeshData {
                 }
             };
 
-            // Roof.
-            m.cuboid(Vec3::new(x0, h, z0), Vec3::new(x1, h, z1), roof, 0.0, Faces { top: true, bottom: false, px: false, nx: false, pz: false, nz: false });
+            // Roof (the stair's is its hut, drawn with the roof furniture).
+            if city.role_at(c) != Role::Stair {
+                m.cuboid(Vec3::new(x0, h, z0), Vec3::new(x1, h, z1), roof, 0.0, Faces { top: true, bottom: false, px: false, nx: false, pz: false, nz: false });
+            }
 
             // Walls: only where the neighbour is lower, storey by storey.
             let pid = city.plot_of[city.idx(c)];
@@ -150,7 +198,7 @@ pub fn build(city: &City, year: u16, mode: ColourMode) -> MeshData {
                 for f in first.max(0)..floors.max(1) {
                     let y0 = (f as f32 * STOREY_M).max(hn);
                     let y1 = ((f + 1) as f32 * STOREY_M).min(h);
-                    if y1 <= y0 {
+                    if y1 <= y0 || holes.contains(&(c, dir, f)) {
                         continue;
                     }
                     let stain = 0.82 + 0.3 * hash(i as u32 ^ (f as u32) << 16, j as u32, dir as u32);
@@ -163,7 +211,40 @@ pub fn build(city: &City, year: u16, mode: ColourMode) -> MeshData {
             }
         }
     }
+    let (pieces, _) = crate::world::roof_furniture(city, year);
+    for p in pieces {
+        m.cuboid(p.aabb.min, p.aabb.max, p.col, 0.0, p.faces);
+    }
     m
+}
+
+/// A lane cell built over: roof on top, blank party walls where it ends.
+fn overbuild_box(m: &mut MeshData, city: &City, c: Cell, y0: f32, y1: f32, over: &std::collections::HashMap<Cell, (f32, f32)>) {
+    let s = CELL_M;
+    let (x0, z0) = (c.0 as f32 * s, c.1 as f32 * s);
+    let (x1, z1) = (x0 + s, z0 + s);
+    let col = facade(hash(c.0 as u32, c.1 as u32, 11).to_bits());
+    m.cuboid(Vec3::new(x0, y1, z0), Vec3::new(x1, y1, z1), mul(srgb(92, 90, 86), 0.9), 0.0, Faces { top: true, bottom: false, px: false, nx: false, pz: false, nz: false });
+    for d in Dir::ALL {
+        let Some(n) = city.step(c, d) else { continue };
+        // Exposed where the neighbour is open lane (or a lower overbuild).
+        let nt = match city.ground_at(n) {
+            Ground::Alley => over.get(&n).map_or(0.0, |o| o.1),
+            Ground::Plot => city.height_at(n, u16::MAX) as f32 * STOREY_M,
+            _ => 0.0,
+        };
+        if city.ground_at(n) == Ground::Plot || nt >= y1 {
+            continue;
+        }
+        let lo = if over.contains_key(&n) { nt.max(y0) } else { y0 };
+        let face = match d {
+            Dir::N => Faces { top: false, bottom: false, px: false, nx: false, pz: false, nz: true },
+            Dir::S => Faces { top: false, bottom: false, px: false, nx: false, pz: true, nz: false },
+            Dir::E => Faces { top: false, bottom: false, px: true, nx: false, pz: false, nz: false },
+            Dir::W => Faces { top: false, bottom: false, px: false, nx: true, pz: false, nz: false },
+        };
+        m.cuboid(Vec3::new(x0, lo, z0), Vec3::new(x1, y1, z1), mul(col, 0.85), 0.0, face);
+    }
 }
 
 /// A window on a storey's wall face: dark glass, or lit (warm tungsten or cold

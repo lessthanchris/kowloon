@@ -1,0 +1,627 @@
+//! The walkable city: one list of boxes that is both what you see inside and what
+//! you collide with. Landings, corridors, walls with doorways, dog-leg stairs,
+//! stair huts, bridges, parapets, ladders, lanes built over at upper floors,
+//! unit doors and shopfronts.
+
+use crate::citymesh::{hash, srgb};
+use glam::Vec3;
+use kwc_engine::mesh::{Faces, MeshData};
+use kwc_sim::*;
+use std::collections::HashMap;
+
+pub const S: f32 = STOREY_M;
+const C: f32 = CELL_M;
+/// Floor slab thickness.
+pub const SLAB: f32 = 0.2;
+/// Partition wall thickness.
+const WALL: f32 = 0.1;
+/// Stair: five risers per half-flight, half a storey each flight.
+const RISERS: usize = 5;
+/// Length of each half-flight run; the rest of the cell is the turning landing.
+const RUN: f32 = 1.15;
+const PARAPET: f32 = 1.0;
+const DOOR_W: f32 = 0.95;
+const DOOR_H: f32 = 2.1;
+/// Lanes are built over from this height up (two storeys of headroom).
+pub const OVERBUILD_FROM: f32 = 2.0 * S;
+
+#[derive(Clone, Copy, Debug)]
+pub struct Aabb {
+    pub min: Vec3,
+    pub max: Vec3,
+}
+
+impl Aabb {
+    pub fn new(min: Vec3, max: Vec3) -> Aabb {
+        Aabb { min: min.min(max), max: min.max(max) }
+    }
+    pub fn overlaps(&self, o: &Aabb) -> bool {
+        self.min.x < o.max.x && self.max.x > o.min.x && self.min.y < o.max.y && self.max.y > o.min.y && self.min.z < o.max.z && self.max.z > o.min.z
+    }
+}
+
+/// A climbable volume: inside it, forward input climbs instead of walking.
+#[derive(Clone, Copy, Debug)]
+pub struct Ladder {
+    pub volume: Aabb,
+    /// Horizontal direction you face to climb it (towards the taller wall).
+    pub facing: Vec3,
+    /// Roof height at the top.
+    pub top: f32,
+}
+
+pub struct WalkWorld {
+    pub boxes: Vec<Aabb>,
+    pub ladders: Vec<Ladder>,
+    buckets: HashMap<(i32, i32), Vec<u32>>,
+    pub spawn: Vec3,
+    pub spawn_yaw: f32,
+}
+
+impl WalkWorld {
+    fn bucket_range(a: &Aabb) -> (i32, i32, i32, i32) {
+        ((a.min.x / C).floor() as i32, (a.max.x / C).floor() as i32, (a.min.z / C).floor() as i32, (a.max.z / C).floor() as i32)
+    }
+
+    fn index(&mut self) {
+        self.buckets.clear();
+        for (n, b) in self.boxes.iter().enumerate() {
+            let (i0, i1, j0, j1) = Self::bucket_range(b);
+            for j in j0..=j1 {
+                for i in i0..=i1 {
+                    self.buckets.entry((i, j)).or_default().push(n as u32);
+                }
+            }
+        }
+    }
+
+    /// Boxes that might touch `q`.
+    pub fn near(&self, q: &Aabb) -> impl Iterator<Item = &Aabb> + '_ {
+        let (i0, i1, j0, j1) = Self::bucket_range(q);
+        let mut ids: Vec<u32> = vec![];
+        for j in j0..=j1 {
+            for i in i0..=i1 {
+                if let Some(v) = self.buckets.get(&(i, j)) {
+                    ids.extend_from_slice(v);
+                }
+            }
+        }
+        ids.sort_unstable();
+        ids.dedup();
+        ids.into_iter().map(move |k| &self.boxes[k as usize])
+    }
+
+    pub fn blocked(&self, q: &Aabb) -> bool {
+        // The whole world stands on solid ground.
+        q.min.y < 0.0 || self.near(q).any(|b| b.overlaps(q))
+    }
+
+    pub fn ladder_at(&self, q: &Aabb) -> Option<&Ladder> {
+        self.ladders.iter().find(|l| l.volume.overlaps(q))
+    }
+}
+
+/// Collects geometry: every piece can render, collide, or both.
+struct Builder {
+    boxes: Vec<Aabb>,
+    ladders: Vec<Ladder>,
+    mesh: MeshData,
+}
+
+impl Builder {
+    fn solid(&mut self, a: Aabb, col: [f32; 3], faces: Faces) {
+        self.boxes.push(a);
+        self.mesh.cuboid(a.min, a.max, col, 0.0, faces);
+    }
+    fn visual(&mut self, a: Aabb, col: [f32; 3], emit: f32, faces: Faces) {
+        self.mesh.cuboid(a.min, a.max, col, emit, faces);
+    }
+}
+
+fn cell_rect(c: Cell) -> (f32, f32, f32, f32) {
+    let (x0, z0) = (c.0 as f32 * C, c.1 as f32 * C);
+    (x0, z0, x0 + C, z0 + C)
+}
+
+/// A strip `t` thick against face `d` of cell `c`, from `a0` to `a1` along the face.
+fn face_box(c: Cell, d: Dir, t: f32, a0: f32, a1: f32, y0: f32, y1: f32) -> Aabb {
+    let (x0, z0, x1, z1) = cell_rect(c);
+    let (lo, hi) = match d {
+        Dir::N => (Vec3::new(x0 + a0, y0, z0), Vec3::new(x0 + a1, y1, z0 + t)),
+        Dir::S => (Vec3::new(x0 + a0, y0, z1 - t), Vec3::new(x0 + a1, y1, z1)),
+        Dir::E => (Vec3::new(x1 - t, y0, z0 + a0), Vec3::new(x1, y1, z0 + a1)),
+        Dir::W => (Vec3::new(x0, y0, z0 + a0), Vec3::new(x0 + t, y1, z0 + a1)),
+    };
+    Aabb::new(lo, hi)
+}
+
+/// Same strip, but just outside the face (in the neighbouring cell).
+fn face_box_out(c: Cell, d: Dir, t: f32, a0: f32, a1: f32, y0: f32, y1: f32) -> Aabb {
+    let mut b = face_box(c, d, 0.0, a0, a1, y0, y1);
+    match d {
+        Dir::N => b.min.z -= t,
+        Dir::S => b.max.z += t,
+        Dir::E => b.max.x += t,
+        Dir::W => b.min.x -= t,
+    }
+    b
+}
+
+/// Local stair coordinates: `u` runs from the landing edge into the stair cell,
+/// `v` across it.
+fn stair_box(c: Cell, to_landing: Dir, u0: f32, u1: f32, v0: f32, v1: f32, y0: f32, y1: f32) -> Aabb {
+    let (x0, z0, x1, z1) = cell_rect(c);
+    let (a, b) = match to_landing {
+        Dir::E => (Vec3::new(x1 - u1, y0, z0 + v0), Vec3::new(x1 - u0, y1, z0 + v1)),
+        Dir::W => (Vec3::new(x0 + u0, y0, z0 + v0), Vec3::new(x0 + u1, y1, z0 + v1)),
+        Dir::S => (Vec3::new(x0 + v0, y0, z1 - u1), Vec3::new(x0 + v1, y1, z1 - u0)),
+        Dir::N => (Vec3::new(x0 + v0, y0, z0 + u0), Vec3::new(x0 + v1, y1, z0 + u1)),
+    };
+    Aabb::new(a, b)
+}
+
+/// World (x, z) of a point in a stair cell's local coordinates (see `stair_box`).
+#[cfg_attr(not(test), allow(dead_code))]
+pub fn stair_point(c: Cell, to_landing: Dir, u: f32, v: f32) -> (f32, f32) {
+    let b = stair_box(c, to_landing, u, u, v, v, 0.0, 0.0);
+    (b.min.x, b.min.z)
+}
+
+pub fn landing_dir(plot: &Plot) -> Dir {
+    dir_between(plot.core[1], plot.core[0]).expect("stair beside its landing")
+}
+
+const ALL: Faces = Faces::ALL;
+const TOP: Faces = Faces { top: true, bottom: false, px: false, nx: false, pz: false, nz: false };
+const TOP_BOTTOM: Faces = Faces { top: true, bottom: true, px: false, nx: false, pz: false, nz: false };
+const BOTTOM: Faces = Faces { top: false, bottom: true, px: false, nx: false, pz: false, nz: false };
+const SIDES: Faces = Faces { top: false, bottom: false, px: true, nx: true, pz: true, nz: true };
+
+fn only(d: Dir) -> Faces {
+    let mut f = Faces { top: false, bottom: false, px: false, nx: false, pz: false, nz: false };
+    match d {
+        Dir::N => f.nz = true,
+        Dir::S => f.pz = true,
+        Dir::E => f.px = true,
+        Dir::W => f.nx = true,
+    }
+    f
+}
+
+fn opposite(d: Dir) -> Dir {
+    match d {
+        Dir::N => Dir::S,
+        Dir::S => Dir::N,
+        Dir::E => Dir::W,
+        Dir::W => Dir::E,
+    }
+}
+
+fn dir_between(a: Cell, b: Cell) -> Option<Dir> {
+    Dir::ALL.into_iter().find(|&d| {
+        let (di, dj) = d.delta();
+        a.0 as i32 + di == b.0 as i32 && a.1 as i32 + dj == b.1 as i32
+    })
+}
+
+/// Paint for corridor walls: institutional greens, pinks and greys, grubby.
+fn paint(plot: u32, f: i32) -> [f32; 3] {
+    const P: &[[u8; 3]] = &[[150, 176, 150], [186, 150, 150], [160, 160, 150], [140, 160, 170], [178, 170, 140]];
+    let c = P[(hash(plot, f as u32, 41) * P.len() as f32) as usize % P.len()];
+    srgb(c[0], c[1], c[2])
+}
+
+fn concrete(k: f32) -> [f32; 3] {
+    let c = srgb(88, 86, 82);
+    [c[0] * k, c[1] * k, c[2] * k]
+}
+
+/// Lane cells built over at upper floors: `(cell, bottom, top)` in metres.
+/// Chosen in patches (smooth noise), only where buildings flank the lane on both
+/// sides, and never over a bridge crossing or right beside the Yamen.
+pub fn overbuild(city: &City, year: u16) -> Vec<(Cell, f32, f32)> {
+    let spans: std::collections::HashSet<Cell> = city.bridges.iter().flat_map(|b| b.span.iter().copied()).collect();
+    let mut out = vec![];
+    for j in 0..city.d as u16 {
+        for i in 0..city.w as u16 {
+            let c = (i, j);
+            if city.ground_at(c) != Ground::Alley || spans.contains(&c) {
+                continue;
+            }
+            if crate::citymesh::near_yamen(city, c) {
+                continue;
+            }
+            let h = |d: Dir| city.step(c, d).map_or(0, |n| if city.ground_at(n) == Ground::Plot { city.height_at(n, year) } else { 0 });
+            let top = h(Dir::E).min(h(Dir::W)).max(h(Dir::N).min(h(Dir::S)));
+            if top < 4 {
+                continue;
+            }
+            // Patchy: neighbouring lane cells mostly agree.
+            let n = value_noise(i as f32 / 6.0, j as f32 / 6.0, city.params.seed as u32);
+            if n < 0.5 {
+                continue;
+            }
+            let top = (top as f32 - (hash(i as u32, j as u32, 5) * 3.0).floor()).max(3.0);
+            out.push((c, OVERBUILD_FROM, top * S));
+        }
+    }
+    out
+}
+
+fn value_noise(x: f32, y: f32, seed: u32) -> f32 {
+    let (xi, yi) = (x.floor(), y.floor());
+    let (fx, fy) = (x - xi, y - yi);
+    let h = |a: f32, b: f32| hash(a as i32 as u32, b as i32 as u32, seed ^ 0x77);
+    let s = |t: f32| t * t * (3.0 - 2.0 * t);
+    let (a, b, c, d) = (h(xi, yi), h(xi + 1.0, yi), h(xi, yi + 1.0), h(xi + 1.0, yi + 1.0));
+    let top = a + (b - a) * s(fx);
+    let bot = c + (d - c) * s(fx);
+    top + (bot - top) * s(fy)
+}
+
+/// Height (m) of the solid top surface on a cell: roofs, the Yamen, overbuilds.
+fn top_of(city: &City, c: Cell, year: u16, over: &HashMap<Cell, (f32, f32)>) -> f32 {
+    match city.ground_at(c) {
+        Ground::Plot => city.height_at(c, year) as f32 * S,
+        Ground::Yamen => crate::citymesh::YAMEN_H,
+        Ground::Alley => over.get(&c).map_or(0.0, |o| o.1),
+        _ => 0.0,
+    }
+}
+
+pub fn build(city: &City, year: u16) -> (WalkWorld, MeshData) {
+    let mut b = Builder { boxes: vec![], ladders: vec![], mesh: MeshData::default() };
+    let over: HashMap<Cell, (f32, f32)> = overbuild(city, year).into_iter().map(|(c, a, t)| (c, (a, t))).collect();
+    let bridges: Vec<&Bridge> = city.bridges.iter().filter(|br| br.year <= year).collect();
+    let is_circ = |c: Cell, pid: u32| city.plot_of[city.idx(c)] == pid && matches!(city.role_at(c), Role::Core | Role::Corridor);
+
+    // Does a bridge leave cell `c` through face `d` at floor `f`?
+    let bridge_through = |c: Cell, d: Dir, f: i32| -> bool {
+        bridges.iter().any(|br| {
+            br.floor as i32 == f && {
+                let first = |from: Cell, to: Cell| dir_between(from, br.span.first().copied().unwrap_or(to));
+                (br.a == c && first(br.a, br.b) == Some(d)) || (br.b == c && {
+                    let last = br.span.last().copied().unwrap_or(br.a);
+                    dir_between(br.b, last) == Some(d)
+                })
+            }
+        })
+    };
+
+    for j in 0..city.d as u16 {
+        for i in 0..city.w as u16 {
+            let c = (i, j);
+            let (x0, z0, x1, z1) = cell_rect(c);
+            match city.ground_at(c) {
+                Ground::Yamen => {
+                    b.boxes.push(Aabb::new(Vec3::new(x0, 0.0, z0), Vec3::new(x1, crate::citymesh::YAMEN_H, z1)));
+                }
+                Ground::Alley => {
+                    if let Some(&(y0, y1)) = over.get(&c) {
+                        // Building over the lane: solid above, a dark soffit below.
+                        b.mesh.ao = 0.3;
+                        b.solid(Aabb::new(Vec3::new(x0, y0, z0), Vec3::new(x1, y1, z1)), concrete(0.6), BOTTOM);
+                        b.mesh.ao = 1.0;
+                    }
+                }
+                Ground::Plot => {
+                    let h = city.height_at(c, year) as i32;
+                    if h == 0 {
+                        continue;
+                    }
+                    let pid = city.plot_of[city.idx(c)];
+                    let plot = &city.plots[pid as usize];
+                    let top = h as f32 * S;
+                    match city.role_at(c) {
+                        Role::Room | Role::None => {
+                            b.boxes.push(Aabb::new(Vec3::new(x0, 0.0, z0), Vec3::new(x1, top, z1)));
+                            // Interior faces towards circulation, storey by storey.
+                            b.mesh.ao = 0.12;
+                            for d in Dir::ALL {
+                                let Some(n) = city.step(c, d) else { continue };
+                                if !is_circ(n, pid) {
+                                    continue;
+                                }
+                                for f in 0..h {
+                                    let y0 = f as f32 * S;
+                                    let wall = face_box(c, d, 0.0, 0.0, C, y0, y0 + S - SLAB);
+                                    b.visual(wall, paint(pid, f), 0.0, only(d));
+                                }
+                            }
+                            b.mesh.ao = 1.0;
+                        }
+                        Role::Core | Role::Corridor => circulation_cell(&mut b, city, c, pid, h, &bridge_through, &is_circ),
+                        Role::Stair => stair_cell(&mut b, city, c, plot, h),
+                    }
+                }
+                _ => {}
+            }
+        }
+    }
+
+    unit_doors(&mut b, city, year);
+    bridge_decks(&mut b, city, &bridges);
+    // Roof furniture is drawn by the city mesher; here it only collides.
+    let (pieces, ladders) = roof_furniture(city, year);
+    b.boxes.extend(pieces.iter().filter(|p| p.solid).map(|p| p.aabb));
+    b.ladders.extend(ladders);
+
+    // Spawn outside the South Gate, looking in along the lane behind it.
+    let (spawn, spawn_yaw) = lane_view(city, city.lanes.iter().find(|l| l.name == "Lung Chun Road"), 0).unwrap_or_else(|| {
+        let g = city.south_gate;
+        (Vec3::new((g.0 as f32 + 0.5) * C, 0.0, (g.1 as f32 + 0.5) * C), 0.0)
+    });
+    let spawn = spawn - Vec3::new(spawn_yaw.cos(), 0.0, spawn_yaw.sin()) * 5.0;
+    let mut w = WalkWorld { boxes: b.boxes, ladders: b.ladders, buckets: HashMap::new(), spawn, spawn_yaw };
+    w.index();
+    (w, b.mesh)
+}
+
+/// A standing spot on a lane at cell index `k` (clamped), facing along it.
+pub fn lane_view(city: &City, lane: Option<&Lane>, k: usize) -> Option<(Vec3, f32)> {
+    let cells = &lane?.cells;
+    if cells.len() < 3 {
+        return None;
+    }
+    let k = k.clamp(0, cells.len() - 3);
+    let (a, b) = (cells[k], cells[(k + 3).min(cells.len() - 1)]);
+    let p = |c: Cell| Vec3::new((c.0 as f32 + 0.5) * C, 0.0, (c.1 as f32 + 0.5) * C);
+    let d = p(b) - p(a);
+    let _ = city;
+    Some((p(a), d.z.atan2(d.x)))
+}
+
+fn circulation_cell(
+    b: &mut Builder,
+    city: &City,
+    c: Cell,
+    pid: u32,
+    h: i32,
+    bridge_through: &dyn Fn(Cell, Dir, i32) -> bool,
+    is_circ: &dyn Fn(Cell, u32) -> bool,
+) {
+    let (x0, z0, x1, z1) = cell_rect(c);
+    let landing = city.role_at(c) == Role::Core;
+    b.mesh.ao = 0.12;
+    for f in 0..=h {
+        let y = f as f32 * S;
+        // Floor slab (its underside is the ceiling of the storey below). The top
+        // slab is the roof, drawn with the roofs.
+        let faces = if f == h { BOTTOM } else if f == 0 { TOP } else { TOP_BOTTOM };
+        b.solid(Aabb::new(Vec3::new(x0, y - SLAB, z0), Vec3::new(x1, y, z1)), concrete(if f == h { 0.5 } else { 0.8 }), faces);
+        if f == h {
+            break;
+        }
+        // Fluorescent tube on landings and every other corridor cell.
+        if landing || hash(c.0 as u32, c.1 as u32, f as u32) < 0.5 {
+            let tube = Aabb::new(Vec3::new(x0 + 0.3, y + S - SLAB - 0.06, z0 + 0.7), Vec3::new(x1 - 0.3, y + S - SLAB - 0.02, z0 + 0.8));
+            let lit = hash(c.0 as u32 + 7, c.1 as u32, f as u32) < 0.85;
+            b.visual(tube, srgb(210, 255, 225), if lit { 1.6 } else { 0.0 }, BOTTOM);
+        }
+        for d in Dir::ALL {
+            let n = city.step(c, d);
+            let open = n.is_some_and(|n| {
+                is_circ(n, pid) || (landing && city.role_at(n) == Role::Stair && city.plot_of[city.idx(n)] == pid)
+            });
+            let same_plot_room = n.is_some_and(|n| city.plot_of[city.idx(n)] == pid && city.role_at(n) == Role::Room);
+            if open || same_plot_room {
+                continue;
+            }
+            let lane = n.is_some_and(|n| city.ground_at(n) == Ground::Alley);
+            let doorway = (f == 0 && landing && lane) || bridge_through(c, d, f);
+            let (y0, y1) = (y, y + S - SLAB);
+            let col = paint(pid, f);
+            if doorway {
+                let (a0, a1) = ((C - DOOR_W) / 2.0, (C + DOOR_W) / 2.0);
+                b.solid(face_box(c, d, WALL, 0.0, a0, y0, y1), col, ALL);
+                b.solid(face_box(c, d, WALL, a1, C, y0, y1), col, ALL);
+                b.solid(face_box(c, d, WALL, a0, a1, y0 + DOOR_H, y1), col, ALL);
+            } else {
+                b.solid(face_box(c, d, WALL, 0.0, C, y0, y1), col, ALL);
+            }
+        }
+    }
+    b.mesh.ao = 1.0;
+}
+
+fn stair_cell(b: &mut Builder, city: &City, c: Cell, plot: &Plot, h: i32) {
+    let landing = plot.core[0];
+    let to_landing = dir_between(c, landing).expect("stair beside its landing");
+    let rise = S / 2.0 / RISERS as f32;
+    let tread = RUN / RISERS as f32;
+    let half = C / 2.0;
+    let step_col = concrete(0.9);
+    b.mesh.ao = 0.12;
+    for f in 0..h {
+        let y = f as f32 * S;
+        for k in 1..=RISERS {
+            // Up the first half-flight, away from the landing...
+            let ta = y + k as f32 * rise;
+            let (u0, u1) = ((k - 1) as f32 * tread, k as f32 * tread);
+            b.solid(stair_box(c, to_landing, u0, u1, 0.0, half, ta - 0.3, ta), step_col, ALL);
+            // ...and back up the second, towards the landing one storey higher.
+            let tb = y + S / 2.0 + k as f32 * rise;
+            let (u0, u1) = (RUN - k as f32 * tread, RUN - (k - 1) as f32 * tread);
+            b.solid(stair_box(c, to_landing, u0, u1, half, C, tb - 0.3, tb), step_col, ALL);
+        }
+        // Turning landing at the far end.
+        let tl = y + S / 2.0;
+        b.solid(stair_box(c, to_landing, RUN, C, 0.0, C, tl - 0.3, tl), step_col, ALL);
+        // A handrail-high divider between the flights (visual).
+        b.visual(stair_box(c, to_landing, 0.0, RUN, half - 0.03, half + 0.03, y, y + S * 0.5 + 1.0), concrete(0.5), 0.0, SIDES);
+    }
+    // Shaft walls on every side but the landing's (the hut above is roof furniture).
+    let top = h as f32 * S;
+    let _ = city;
+    for d in Dir::ALL {
+        if d != to_landing {
+            b.solid(face_box(c, d, WALL, 0.0, C, 0.0, top), concrete(0.75), ALL);
+        }
+    }
+    b.mesh.ao = 1.0;
+}
+
+/// Unit doors (metal gates) on corridors, and shopfronts on the lanes.
+fn unit_doors(b: &mut Builder, city: &City, year: u16) {
+    for u in city.units_at(year) {
+        let c = u.door.cell;
+        let d = u.door.facing;
+        let y = u.floor as f32 * S;
+        let (a0, a1) = ((C - DOOR_W) / 2.0, (C + DOOR_W) / 2.0);
+        let r = hash(u.id, 3, 3);
+        let outside = city.step(c, d).is_some_and(|n| city.ground_at(n) == Ground::Alley);
+        if outside {
+            // Shopfront: most of the cell width; open ones glow, shut ones are shutters.
+            b.mesh.ao = 1.0;
+            let front = face_box_out(c, d, 0.03, 0.08, C - 0.08, y, y + 2.5);
+            if u.door_state == DoorState::Open {
+                let col = if r < 0.5 { srgb(255, 214, 160) } else { srgb(220, 255, 230) };
+                b.visual(front, col, 0.9, only(d));
+            } else {
+                b.visual(front, srgb(120, 124, 126), 0.0, only(d));
+            }
+        } else {
+            b.mesh.ao = 0.12;
+            let door = face_box_out(c, d, 0.04, a0, a1, y, y + DOOR_H);
+            if u.door_state == DoorState::Open {
+                b.visual(door, srgb(255, 200, 150), 0.7, only(d));
+            } else {
+                const GATES: &[[u8; 3]] = &[[70, 110, 80], [120, 60, 50], [60, 80, 120], [140, 130, 110], [90, 90, 90]];
+                let g = GATES[(r * GATES.len() as f32) as usize % GATES.len()];
+                b.visual(door, srgb(g[0], g[1], g[2]), 0.0, only(d));
+            }
+        }
+    }
+    b.mesh.ao = 1.0;
+}
+
+fn bridge_decks(b: &mut Builder, city: &City, bridges: &[&Bridge]) {
+    for br in bridges {
+        if br.span.is_empty() {
+            continue;
+        }
+        let y = br.floor as f32 * S;
+        let across = dir_between(br.a, br.span[0]).unwrap_or(Dir::E);
+        for &c in &br.span {
+            let (x0, z0, x1, z1) = cell_rect(c);
+            b.mesh.ao = 0.6;
+            b.solid(Aabb::new(Vec3::new(x0, y - SLAB, z0), Vec3::new(x1, y, z1)), concrete(0.7), ALL);
+            // Railings along both sides of the crossing.
+            let sides = match across {
+                Dir::E | Dir::W => [Dir::N, Dir::S],
+                _ => [Dir::E, Dir::W],
+            };
+            for s in sides {
+                b.solid(face_box(c, s, 0.05, 0.0, C, y, y + 1.05), srgb(90, 110, 100), ALL);
+            }
+        }
+    }
+    b.mesh.ao = 1.0;
+    let _ = city;
+}
+
+/// Roof furniture: parapets, stair huts and ladders. Drawn by the city mesher
+/// (so they're on the skyline in the overview) and collided with when walking.
+pub struct Piece {
+    pub aabb: Aabb,
+    pub col: [f32; 3],
+    pub faces: Faces,
+    pub solid: bool,
+}
+
+pub fn roof_furniture(city: &City, year: u16) -> (Vec<Piece>, Vec<Ladder>) {
+    let over: HashMap<Cell, (f32, f32)> = overbuild(city, year).into_iter().map(|(c, a, t)| (c, (a, t))).collect();
+    let mut out: Vec<Piece> = vec![];
+    let mut ladders = vec![];
+    let mut put = |aabb: Aabb, col: [f32; 3], solid: bool| out.push(Piece { aabb, col, faces: ALL, solid });
+    let wood = srgb(150, 120, 80);
+
+    // Stair huts.
+    for plot in &city.plots {
+        let h = plot.height_at(year);
+        if h == 0 {
+            continue;
+        }
+        let (c, d) = (plot.core[1], landing_dir(plot));
+        let top = h as f32 * S;
+        let hut = top + 2.4;
+        let (x0, z0, x1, z1) = cell_rect(c);
+        for side in Dir::ALL {
+            if side != d {
+                put(face_box(c, side, WALL, 0.0, C, top, hut), concrete(0.75), true);
+            }
+        }
+        put(face_box(c, d, WALL, 0.0, C, top + DOOR_H, hut), concrete(0.75), true);
+        put(Aabb::new(Vec3::new(x0, hut, z0), Vec3::new(x1, hut + 0.15, z1)), concrete(0.7), true);
+    }
+
+    // One ladder per pair of neighbouring roofs of different heights.
+    let mut laddered: std::collections::HashSet<(u32, u32)> = std::collections::HashSet::new();
+    let mut ladder_cells: std::collections::HashSet<(Cell, Dir)> = std::collections::HashSet::new();
+    for j in 0..city.d as u16 {
+        for i in 0..city.w as u16 {
+            let c = (i, j);
+            if city.ground_at(c) != Ground::Plot || city.role_at(c) == Role::Stair || city.height_at(c, year) == 0 {
+                continue;
+            }
+            let (pid, h) = (city.plot_of[city.idx(c)], city.height_at(c, year));
+            for d in Dir::ALL {
+                let Some(n) = city.step(c, d) else { continue };
+                if city.ground_at(n) != Ground::Plot || city.role_at(n) == Role::Stair {
+                    continue;
+                }
+                let q = city.plot_of[city.idx(n)];
+                if q != pid && city.height_at(n, year) > h && laddered.insert((pid.min(q), pid.max(q))) {
+                    ladder_cells.insert((c, d));
+                }
+            }
+        }
+    }
+
+    for j in 0..city.d as u16 {
+        for i in 0..city.w as u16 {
+            let c = (i, j);
+            let top = top_of(city, c, year, &over);
+            if top <= 0.0 || city.ground_at(c) == Ground::Yamen || city.role_at(c) == Role::Stair {
+                continue;
+            }
+            let is_plot = city.ground_at(c) == Ground::Plot;
+            let pid = city.plot_of[city.idx(c)];
+            for d in Dir::ALL {
+                let n = city.step(c, d);
+                let nt = n.map_or(0.0, |n| top_of(city, n, year, &over));
+                if n.is_some_and(|n| is_plot && city.plot_of[city.idx(n)] == pid) {
+                    continue;
+                }
+                if ladder_cells.contains(&(c, d)) {
+                    // Ladder up the taller neighbour's wall.
+                    put(face_box(c, d, 0.06, 0.45, 0.5, top, nt + 0.9), wood, false);
+                    put(face_box(c, d, 0.06, 1.0, 1.05, top, nt + 0.9), wood, false);
+                    let mut y = top + 0.3;
+                    while y < nt {
+                        put(face_box(c, d, 0.06, 0.45, 1.05, y, y + 0.04), wood, false);
+                        y += 0.3;
+                    }
+                    let (dx, dz) = d.delta();
+                    ladders.push(Ladder {
+                        volume: face_box(c, d, 0.35, 0.45, 1.05, top, nt + 0.9),
+                        facing: Vec3::new(dx as f32, 0.0, dz as f32),
+                        top: nt,
+                    });
+                    continue;
+                }
+                if nt < top - 0.4 {
+                    // A drop: parapet, with a gap where a ladder arrives from below.
+                    let col = concrete(0.8);
+                    if n.is_some_and(|n| ladder_cells.contains(&(n, opposite(d)))) {
+                        put(face_box(c, d, WALL, 0.0, 0.4, top, top + PARAPET), col, true);
+                        put(face_box(c, d, WALL, 1.1, C, top, top + PARAPET), col, true);
+                    } else {
+                        put(face_box(c, d, WALL, 0.0, C, top, top + PARAPET), col, true);
+                    }
+                }
+            }
+        }
+    }
+    (out, ladders)
+}
