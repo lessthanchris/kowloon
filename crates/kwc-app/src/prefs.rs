@@ -26,11 +26,14 @@ pub enum Action {
     Restart,
     Help,
     Vsync,
-    Route,
+    /// A binding from an older version for an action that's gone (the
+    /// practice route line); dropped on load.
+    #[serde(other)]
+    Retired,
 }
 
 impl Action {
-    pub const ALL: [Action; 18] = [
+    pub const ALL: [Action; 17] = [
         Action::Forward,
         Action::Back,
         Action::Left,
@@ -48,7 +51,6 @@ impl Action {
         Action::Restart,
         Action::Help,
         Action::Vsync,
-        Action::Route,
     ];
 
     pub fn label(self) -> &'static str {
@@ -70,7 +72,7 @@ impl Action {
             Action::Restart => "Restart race",
             Action::Help => "Help card",
             Action::Vsync => "Vsync",
-            Action::Route => "Route line (practice)",
+            Action::Retired => "",
         }
     }
 
@@ -93,7 +95,7 @@ impl Action {
             Action::Restart => KeyCode::KeyR,
             Action::Help => KeyCode::KeyH,
             Action::Vsync => KeyCode::KeyV,
-            Action::Route => KeyCode::KeyK,
+            Action::Retired => KeyCode::F12,
         }
     }
 }
@@ -166,6 +168,7 @@ impl Prefs {
     pub fn load() -> (Prefs, bool) {
         match std::fs::read_to_string(FILE).ok().and_then(|s| serde_json::from_str::<Prefs>(&s).ok()) {
             Some(mut p) => {
+                p.keys.retain(|(a, _)| *a != Action::Retired);
                 // Actions added since the file was written get their defaults.
                 for a in Action::ALL {
                     if !p.keys.iter().any(|(b, _)| *b == a) {
@@ -237,5 +240,14 @@ mod tests {
         for a in Action::ALL {
             assert_eq!(Action::ALL.iter().filter(|&&b| back.key(b) == back.key(a)).count(), 1, "{a:?} shares a key");
         }
+    }
+
+    #[test]
+    fn settings_from_older_versions_still_load() {
+        // alpha.2 had a Route action; its binding is simply dropped.
+        let json = r#"{"sensitivity":1.5,"keys":[["Forward","T"],["Route","K"]]}"#;
+        let p: Prefs = serde_json::from_str(json).expect("still loads");
+        assert_eq!(p.sensitivity, 1.5);
+        assert_eq!(p.key(Action::Forward), KeyCode::KeyT);
     }
 }

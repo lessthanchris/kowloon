@@ -16,7 +16,7 @@ From the title screen:
 - **Race:** 5 deliveries against the clock on a **course code** such as `KWC-1965-7F3A`. Every `KWC` code is set in the same Walled City, so what you learn carries over; `KWX` codes grow a fresh "wild" city. The same code gives the same jobs, so you can share one and race a friend. Your best run comes back as a ghost. There are three categories:
   - **Rounds:** arrow and door names on.
   - **Memory:** street plaques and signposts only.
-  - **Practice:** no clock, and a route line (K) shows you the way.
+  - **Practice:** no clock and no bests. Learn the course at your own pace.
 
   Eras open one at a time: finish a race in one to unlock the next. There's a new daily course every day.
 
@@ -34,7 +34,6 @@ Signposts at lane junctions and gates point the walking way to the landmarks in 
 | T / N | torch / night |
 | R | run a race again |
 | P | autopilot demo (campaign) |
-| K | route line (Practice) |
 | V | vsync on/off |
 | F11 | fullscreen |
 | Esc | menu |

@@ -9,13 +9,13 @@ Title screen:
   Race     - 5 deliveries against the clock on a course code (e.g. KWC-1965-7F3A).
              KWC codes are all in the same city, the one to learn; KWX codes
              grow a fresh wild city. Same code = same jobs: race a friend.
-             Rounds (arrow on), Memory (signs only) or Practice (no clock,
-             route line on K). Finish a race in an era to open the next.
+             Rounds (arrow on), Memory (signs only) or Practice (no clock).
+             Finish a race in an era to open the next.
              Your best run comes back as a ghost.
 
 Keys: WASD walk, mouse look, Shift jog, Space hop/vault, E knock,
       M notebook, L ledger, G memory mode, T torch, N night,
-      R restart race, K route line, P autopilot, V vsync, F11 fullscreen, Esc menu.
+      R restart race, P autopilot, V vsync, F11 fullscreen, Esc menu.
       All keys can be changed: Settings, on the title screen.
 
 This is an early alpha: no sound yet, and saves may not carry over between

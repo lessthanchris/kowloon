@@ -66,8 +66,6 @@ struct Settings {
     race_cat: runs::Category,
     race_era: u16,
     wild: bool,
-    /// Practice: the route line to the next door.
-    route_on: bool,
     /// The settings panel, and the action waiting for a key to be pressed.
     settings_open: bool,
     rebinding: Option<prefs::Action>,
@@ -197,9 +195,8 @@ struct App {
     race: Option<runs::Run>,
     records: runs::Records,
     prefs: prefs::Prefs,
-    /// The guided tour, when it's on; the practice route line.
+    /// The guided tour, when it's on.
     tour: Option<Tour>,
-    guide: autopilot::Guide,
     started: Instant,
     plane: Option<GpuMesh>,
     /// Everyone near you, posed for this frame.
@@ -307,9 +304,6 @@ impl ApplicationHandler for App {
                                     self.prefs.vsync = on;
                                     self.prefs.save();
                                 }
-                            }
-                            Some(A::Route) if self.race.as_ref().is_some_and(|r| r.cat == runs::Category::Practice) => {
-                                self.settings.route_on = !self.settings.route_on;
                             }
                             Some(A::Knock) if walking && self.tour.is_none() => self.interact(),
                             Some(A::Help) => self.settings.help = !self.settings.help,
@@ -435,8 +429,6 @@ impl App {
         self.race = None;
         self.autopilot = None;
         self.tour = None;
-        self.guide = autopilot::Guide::default();
-        self.settings.route_on = false;
         self.pending_era = None;
         self.settings.map_open = false;
         self.settings.ledger_open = false;
@@ -476,7 +468,6 @@ impl App {
         self.settings.year = course.era as f32;
         self.race = Some(runs::Run::new(course, cat, &self.records));
         self.settings.memory = cat == runs::Category::Memory;
-        self.settings.route_on = cat == runs::Category::Practice;
         self.settings.help = false;
         self.settings.course = None;
         self.autopilot = None;
@@ -664,13 +655,6 @@ impl App {
         if let Some(t) = self.tour.as_mut() {
             t.tick(dt);
         }
-        match (self.walk.as_ref(), self.race.as_ref()) {
-            (Some(w), Some(r)) if r.cat == runs::Category::Practice && self.settings.route_on => {
-                let to = self.game.as_ref().and_then(|g| autopilot::target(g, &w.spots)).map(|t| t.stand);
-                self.guide.update(&w.world, &self.world.city, w.year, w.player.pos, to, dt);
-            }
-            _ => self.guide.path.clear(),
-        }
         if let Some(g) = self.game.as_mut() {
             g.tick(dt);
             if g.job.is_none() {
@@ -758,7 +742,6 @@ impl App {
             if let Some(g) = race.and_then(|r| r.ghost.as_ref().map(|g| (g, r.ticks))).map(|(g, ticks)| g.at(ticks)) {
                 people::ghost_mesh(&mut m, g.0, g.1, g.2, g.3, t);
             }
-            self.guide.mesh(&mut m, cam.eye);
             GpuMesh::upload(&run.gpu.device, &m)
         });
         let mut meshes: Vec<&GpuMesh> = self.world.mesh.iter().chain(self.plane.iter()).chain(self.people.iter()).collect();
@@ -781,7 +764,6 @@ impl App {
         let progress = game.map(|g| (g.coverage(city), g.clean, g.knows_era(city), g.next_era()));
         let pending = self.pending_era;
         let (title, race, records, summary) = (self.title, self.race.as_ref(), &self.records, self.save_summary.as_deref());
-        let route_key = prefs::key_name(self.prefs.key(prefs::Action::Route));
         let caption = self.tour.as_ref().and_then(|t| t.caption());
         let unlocked = self.records.unlocked();
         let prefs = &mut self.prefs;
@@ -791,7 +773,7 @@ impl App {
             (Some(w), Some(info)) => {
                 hud(ui, w, s, game, info, fps, progress);
                 if let Some(r) = race {
-                    runs::hud(ui, r, &route_key, s.route_on);
+                    runs::hud(ui, r);
                 }
                 if let Some((name, about)) = &caption {
                     tour_card(ui, name, about);
@@ -845,7 +827,7 @@ impl App {
 fn keys_line(p: &prefs::Prefs) -> String {
     use prefs::{key_name as n, Action as A};
     format!(
-        "{}{}{}{} walk · {} jog · {} hop/vault · {} knock · {} autopilot · {} notebook · {} ledger · {} memory · {} move on · {} torch · {} night · {} help · {} route (practice) · Esc menu · Tab overview · {} vsync",
+        "{}{}{}{} walk · {} jog · {} hop/vault · {} knock · {} autopilot · {} notebook · {} ledger · {} memory · {} move on · {} torch · {} night · {} help · Esc menu · Tab overview · {} vsync",
         n(p.key(A::Forward)),
         n(p.key(A::Left)),
         n(p.key(A::Back)),
@@ -861,7 +843,6 @@ fn keys_line(p: &prefs::Prefs) -> String {
         n(p.key(A::Torch)),
         n(p.key(A::Night)),
         n(p.key(A::Help)),
-        n(p.key(A::Route)),
         n(p.key(A::Vsync)),
     )
 }
@@ -1037,7 +1018,7 @@ fn title_screen(ui: &mut egui::Ui, s: &mut Settings, records: &runs::Records, su
             let hint = match s.race_cat {
                 runs::Category::Rounds => "Arrow and door names on.",
                 runs::Category::Memory => "Street plaques and signposts only: you find the way.",
-                runs::Category::Practice => "No clock. The route line (and the notebook) show you the way.",
+                runs::Category::Practice => "No clock and no bests: learn the course at your own pace, notebook in hand.",
             };
             ui.colored_label(dim, RichText::new(hint).small());
             if !unlocked.contains(&s.race_era) {
@@ -1644,7 +1625,6 @@ fn main() {
             race_cat: runs::Category::Rounds,
             race_era: START_YEAR,
             wild: false,
-            route_on: false,
             settings_open: false,
             rebinding: None,
             keys_line: String::new(),
@@ -1663,7 +1643,6 @@ fn main() {
         records: runs::Records::load(),
         prefs: prefs::Prefs::load().0,
         tour: None,
-        guide: autopilot::Guide::default(),
         started: Instant::now(),
         plane: None,
         people: None,

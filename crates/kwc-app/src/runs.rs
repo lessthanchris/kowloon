@@ -82,7 +82,7 @@ pub enum Category {
     Rounds,
     /// Nothing but the street plaques: you find the way.
     Memory,
-    /// No clock, no bests: learn the course, with the route line (K).
+    /// No clock, no bests: learn the course at your own pace.
     Practice,
 }
 
@@ -220,14 +220,13 @@ fn signed(d: f32) -> String {
 }
 
 /// The clock and splits (top left), and the results card once it's done.
-pub fn hud(ui: &mut egui::Ui, r: &Run, route_key: &str, route_on: bool) {
+pub fn hud(ui: &mut egui::Ui, r: &Run) {
     let paper = Color32::from_rgb(236, 228, 208);
     if r.cat == Category::Practice {
         egui::Area::new(egui::Id::new("run")).anchor(Align2::LEFT_TOP, [16.0, 16.0]).show(ui.ctx(), |ui| {
             egui::Frame::new().fill(Color32::from_rgba_unmultiplied(20, 18, 16, 225)).inner_margin(12.0).corner_radius(4.0).show(ui, |ui| {
                 ui.colored_label(Color32::from_rgb(150, 200, 255), RichText::new(format!("{} · Practice", r.course.code())).small().monospace());
                 ui.colored_label(paper, RichText::new(format!("{} delivered", r.splits.len())).size(18.0));
-                ui.colored_label(Color32::from_gray(170), RichText::new(format!("{route_key}: route line {}", if route_on { "on" } else { "off" })).small());
             });
         });
         return;
