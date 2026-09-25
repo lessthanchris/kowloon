@@ -3,6 +3,7 @@
 //!
 //! No graphics here. The engine consumes a [`City`] and renders/meshes it.
 
+pub mod address;
 pub mod circulation;
 pub mod city;
 pub mod export;
@@ -10,7 +11,9 @@ pub mod features;
 pub mod growth;
 pub mod interior;
 pub mod layout;
+pub mod names;
 pub mod site;
+pub mod society;
 pub mod stats;
 pub mod units;
 pub mod walk;
